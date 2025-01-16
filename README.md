@@ -1,2 +1,2 @@
-# longfi
-An AI generated lofi music player that plays infinitely long tracks based on a selected mood.
+# LofAI
+An AI powered Lo-Fi music player that plays infinitely based on a user's selected mood and tempo.
