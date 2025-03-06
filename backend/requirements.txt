@@ -1,0 +1,9 @@
+fastapi==0.115.8
+uvicorn==0.34.0
+python-multipart==0.0.20
+websockets==14.2
+fal==1.7.6
+fal-serverless==0.6.41
+python-jose==3.3.0
+pydantic==4.12.2
+python-dotenv==1.0.1
