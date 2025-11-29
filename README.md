@@ -16,7 +16,7 @@ An AI generated lofi music player that plays infinitely long tracks based on a s
 
 - **Backend**: Python, FastAPI, WebSockets
 - **Frontend**: Next.js, React, TypeScript, Tailwind CSS
-- **AI**: Meta's MusicGen via fal.ai API
+- **AI**: Meta's MusicGen Text-To-Speech Transformer Model
 
 ## Setup:
 
