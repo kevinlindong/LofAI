@@ -2,7 +2,9 @@
 
 An ai powered lo-fi music player with fun productivity features!
 
-## How it works:
+## Overview:
+
+<img width="882" alt="Summary" src="https://github.com/kevinlindong/lofAI/blob/main/lofAI.png">
 
 - Backend generates lo-fi tracks using Meta's MusicGen text-to-audio transformer model
 - Frontend plays tracks sequentially with seamless transitions
