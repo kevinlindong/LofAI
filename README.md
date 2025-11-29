@@ -1,6 +1,6 @@
 # lofAI
 
-An ai powered lo-fi music player with fun productivity features!
+An AI generated lofi music player that plays infinitely long tracks based on a selected mood.
 
 ## Screenshot:
 
