@@ -1,37 +1,38 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { Moon, Sun } from "lucide-react"
-import { Button } from "@/components/ui/button"
+import { useEffect, useState } from "react"
+import { DotGlyph } from "@/components/dot-glyph"
 
 export function ThemeToggle() {
-  const [isDarkMode, setIsDarkMode] = useState(false)
+  const [isDark, setIsDark] = useState(true)
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
     setMounted(true)
-    const isDark = localStorage.getItem("darkMode") === "true"
-    setIsDarkMode(isDark)
-    document.documentElement.classList.toggle("dark", isDark)
+    // the inline script in the document head already applied the theme; read
+    // back what it decided rather than deciding again
+    setIsDark(document.documentElement.classList.contains("dark"))
   }, [])
 
-  const toggleDarkMode = () => {
-    const newMode = !isDarkMode
-    setIsDarkMode(newMode)
-    localStorage.setItem("darkMode", newMode.toString())
-    document.documentElement.classList.toggle("dark", newMode)
+  const toggle = () => {
+    const next = !isDark
+    setIsDark(next)
+    localStorage.setItem("darkMode", String(next))
+    document.documentElement.classList.toggle("dark", next)
   }
 
   return (
-    <Button 
-      variant="outline" 
-      size="icon" 
-      className="fixed top-4 left-4 z-50" 
-      onClick={toggleDarkMode}
+    <button
+      type="button"
+      onClick={toggle}
+      className="key h-8 px-3 text-[0.7rem]"
       style={{ opacity: mounted ? 1 : 0 }}
+      aria-label={isDark ? "Switch to paper" : "Switch to panel"}
     >
-      {isDarkMode ? <Sun className="h-[1.2rem] w-[1.2rem]" /> : <Moon className="h-[1.2rem] w-[1.2rem]" />}
-      <span className="sr-only">Toggle theme</span>
-    </Button>
+      <DotGlyph name={isDark ? "sun" : "moon"} dot={2} />
+      <span className="hidden sm:inline">{isDark ? "paper" : "panel"}</span>
+    </button>
   )
 }
+
+export default ThemeToggle

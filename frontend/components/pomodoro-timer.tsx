@@ -1,191 +1,167 @@
-import { useState, useEffect, useRef } from "react"
-import { Button } from "@/components/ui/button"
-import { Slider } from "@/components/ui/slider"
-import { Play, Pause, RotateCcw } from "lucide-react"
+"use client"
 
-export function PomodoroTimer() {
-  const [isRunning, setIsRunning] = useState(false)
-  const [timeLeft, setTimeLeft] = useState(25 * 60)
-  const [isBreak, setIsBreak] = useState(false)
+import { useCallback, useEffect, useRef, useState } from "react"
+import { DotGlyph } from "@/components/dot-glyph"
+import { DotSlider } from "@/components/dot-slider"
+
+interface PomodoroTimerProps {
+  onRunningChange: (running: boolean) => void
+}
+
+const SEGMENTS = 28
+
+const formatTime = (seconds: number) => {
+  const total = Math.max(0, Math.ceil(seconds))
+  const mins = Math.floor(total / 60)
+  const secs = total % 60
+  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`
+}
+
+export function PomodoroTimer({ onRunningChange }: PomodoroTimerProps) {
   const [workDuration, setWorkDuration] = useState(25)
   const [breakDuration, setBreakDuration] = useState(5)
-  const [progress, setProgress] = useState(0)
-  const timerRef = useRef<NodeJS.Timeout | null>(null)
+  const [isBreak, setIsBreak] = useState(false)
+  const [isRunning, setIsRunning] = useState(false)
+  const [timeLeft, setTimeLeft] = useState(25 * 60)
+
+  // the phase ends at a wall-clock instant, not after N ticks. counting ticks
+  // drifts, and drifts more the longer the tab is backgrounded.
+  const deadlineRef = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
-  const progressRef = useRef<number>(0)
-  const lastTickRef = useRef<number>(0)
+  // the interval closes over the phase; a ref is the only copy it can trust
+  const isBreakRef = useRef(isBreak)
+  isBreakRef.current = isBreak
+
+  const total = (isBreak ? breakDuration : workDuration) * 60
 
   useEffect(() => {
-    // Initialize Audio after mount to prevent hydration errors
-    if (typeof window !== "undefined") {
-      audioRef.current = new Audio("/timer-end.mp3")
-      lastTickRef.current = Date.now()
-    }
+    const audio = new Audio("/timer-end.mp3")
+    audioRef.current = audio
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current)
+      audio.pause()
+      audio.removeAttribute("src")
+      audio.load()
+      if (audioRef.current === audio) audioRef.current = null
     }
   }, [])
 
-  const startTimer = () => {
-    setIsRunning(true)
-    lastTickRef.current = Date.now()
-    timerRef.current = setInterval(() => {
-      const now = Date.now()
-      const deltaTime = (now - lastTickRef.current) / 1000
-      lastTickRef.current = now
-
-      setTimeLeft((prev) => {
-        if (prev <= deltaTime) {
-          audioRef.current?.play()
-          if (timerRef.current) clearInterval(timerRef.current)
-          setIsRunning(false)
-          const nextIsBreak = !isBreak
-          setIsBreak(nextIsBreak)
-          return nextIsBreak ? breakDuration * 60 : workDuration * 60
-        }
-        return prev - deltaTime
-      })
-    }, 50) // Update more frequently for smoother animation
-  }
-
-  const pauseTimer = () => {
-    setIsRunning(false)
-    if (timerRef.current) clearInterval(timerRef.current)
-  }
-
-  const resetTimer = () => {
-    setIsRunning(false)
-    if (timerRef.current) clearInterval(timerRef.current)
-    setTimeLeft(workDuration * 60)
-    setIsBreak(false)
-    setProgress(0)
-    progressRef.current = 0
-  }
-
-  // Smooth progress update
   useEffect(() => {
-    let animationFrame: number
+    onRunningChange(isRunning)
+  }, [isRunning, onRunningChange])
 
-    const updateProgress = () => {
-      if (isRunning) {
-        const duration = isBreak ? breakDuration * 60 : workDuration * 60
-        const timeElapsed = isBreak ? 
-          (breakDuration * 60 - timeLeft) : 
-          (workDuration * 60 - timeLeft)
-        
-        const targetProgress = isBreak ? 
-          1 - (timeElapsed / duration) : 
-          timeElapsed / duration
-
-        // Smooth progress interpolation
-        const diff = targetProgress - progressRef.current
-        const step = diff * 0.1 // Adjust this value to control smoothness
-        progressRef.current += step
-        setProgress(progressRef.current)
+  useEffect(() => {
+    if (!isRunning) return
+    const id = setInterval(() => {
+      const left = (deadlineRef.current - Date.now()) / 1000
+      if (left <= 0) {
+        setTimeLeft(0)
+        setIsRunning(false)
+        void audioRef.current?.play().catch(() => {})
+        const wasBreak = isBreakRef.current
+        setIsBreak(!wasBreak)
+        setTimeLeft((wasBreak ? workDuration : breakDuration) * 60)
+        return
       }
+      setTimeLeft(left)
+    }, 200)
+    return () => clearInterval(id)
+  }, [isRunning, workDuration, breakDuration])
 
-      animationFrame = requestAnimationFrame(updateProgress)
-    }
+  const toggle = useCallback(() => {
+    setIsRunning((running) => {
+      if (running) return false
+      deadlineRef.current = Date.now() + timeLeft * 1000
+      return true
+    })
+  }, [timeLeft])
 
-    animationFrame = requestAnimationFrame(updateProgress)
+  const reset = useCallback(() => {
+    setIsRunning(false)
+    setIsBreak(false)
+    setTimeLeft(workDuration * 60)
+  }, [workDuration])
 
-    return () => {
-      cancelAnimationFrame(animationFrame)
-    }
-  }, [isRunning, timeLeft, isBreak, workDuration, breakDuration])
-
-  // Reset progress when switching between work and break
-  useEffect(() => {
-    progressRef.current = isBreak ? 1 : 0
-    setProgress(progressRef.current)
-  }, [isBreak])
-
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = Math.floor(seconds % 60)
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`
+  const setPhaseDuration = (minutes: number, forBreak: boolean) => {
+    if (forBreak) setBreakDuration(minutes)
+    else setWorkDuration(minutes)
+    if (!isRunning && isBreak === forBreak) setTimeLeft(minutes * 60)
   }
+
+  const elapsed = total > 0 ? 1 - timeLeft / total : 0
+  const lit = Math.round(Math.min(1, Math.max(0, elapsed)) * SEGMENTS)
 
   return (
-    <div className="w-full max-w-md mx-auto aspect-square flex flex-col items-center justify-center relative">
-      <div
-        className="absolute inset-0 rounded-full"
-        style={{
-          background: isBreak
-            ? `conic-gradient(from 0deg, transparent ${(1 - progress) * 360}deg, hsl(var(--accent)) ${(1 - progress) * 360}deg)`
-            : `conic-gradient(from 0deg, hsl(var(--accent)) ${progress * 360}deg, transparent ${progress * 360}deg)`,
-          transition: 'background 0.1s linear',
-        }}
-      />
+    <div className="flex flex-col gap-4">
+      <div className="flex items-baseline justify-between">
+        <span className="label">{isBreak ? "Break" : "Focus"}</span>
+        <span className="label">{isRunning ? "running" : "held"}</span>
+      </div>
 
-      <div className="z-10 bg-card rounded-full w-[95%] h-[95%] flex flex-col items-center justify-center">
-        <div className="text-base xs:text-lg sm:text-2xl md:text-3xl font-bold mb-1 sm:mb-2 dark:text-white">
+      <div className="flex items-center justify-between gap-4">
+        <span
+          className="tabular-nums leading-none"
+          style={{
+            fontSize: "2.6rem",
+            letterSpacing: "0.02em",
+            color: isRunning ? "var(--accent)" : "var(--text)",
+          }}
+        >
           {formatTime(timeLeft)}
-        </div>
+        </span>
 
-        <div className="flex space-x-1 xs:space-x-2 mb-2 xs:mb-4">
-          <Button
-            onClick={isRunning ? pauseTimer : startTimer}
-            variant="outline"
-            size="sm"
-            className="h-5 w-5 xs:h-6 xs:w-6 sm:h-8 sm:w-8 p-0"
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={toggle}
+            className="key h-9 w-9"
+            aria-label={isRunning ? "Pause timer" : "Start timer"}
           >
-            {isRunning ? (
-              <Pause className="h-2 w-2 xs:h-3 xs:w-3 sm:h-4 sm:w-4" />
-            ) : (
-              <Play className="h-2 w-2 xs:h-3 xs:w-3 sm:h-4 sm:w-4" />
-            )}
-          </Button>
-          <Button 
-            onClick={resetTimer} 
-            variant="outline" 
-            size="sm" 
-            className="h-5 w-5 xs:h-6 xs:w-6 sm:h-8 sm:w-8 p-0"
-          >
-            <RotateCcw className="h-2 w-2 xs:h-3 xs:w-3 sm:h-4 sm:w-4" />
-          </Button>
+            <DotGlyph name={isRunning ? "pause" : "play"} dot={2} />
+          </button>
+          <button type="button" onClick={reset} className="key h-9 w-9" aria-label="Reset timer">
+            <DotGlyph name="rewind" dot={2} />
+          </button>
         </div>
+      </div>
 
-        <div className="w-full space-y-2 xs:space-y-4 sm:space-y-7 px-2 sm:px-4">
-          {[
-            { label: "Work", value: workDuration, setValue: setWorkDuration, max: 60 },
-            { label: "Break", value: breakDuration, setValue: setBreakDuration, max: 30 },
-          ].map((item, index) => (
-            <div key={item.label} className="space-y-2 xs:space-y-3">
-              <div
-                className="flex justify-between text-[8px] xs:text-[10px] sm:text-xs dark:text-gray-300 font-medium"
-                style={{
-                  width: `${100 - (index + 1.5) * 10}%`,
-                  marginLeft: `${(index + 1.5) * 5}%`,
-                }}
-              >
-                <span>{item.label}</span>
-                <span>{item.value} min</span>
-              </div>
-              <div className="relative">
-                <Slider
-                  value={[item.value]}
-                  onValueChange={(values) => {
-                    item.setValue(values[0])
-                    if (!isRunning && (index === 0 ? !isBreak : isBreak)) {
-                      setTimeLeft(values[0] * 60)
-                    }
-                  }}
-                  min={1} 
-                  max={item.max}
-                  step={1}
-                  disabled={isRunning}
-                  className="absolute inset-0 [&_[role='slider']]:h-2 [&_[role='slider']]:w-2 xs:[&_[role='slider']]:h-3 xs:[&_[role='slider']]:w-3 sm:[&_[role='slider']]:h-4 sm:[&_[role='slider']]:w-4"
-                  style={{
-                    width: `${100 - (index + 1.5) * 10}%`,
-                    left: `${(index + 1.5) * 5}%`,
-                  }}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
+      <div className="flex items-center justify-between" aria-hidden>
+        {Array.from({ length: SEGMENTS }, (_, i) => (
+          <span
+            key={i}
+            className="rounded-full"
+            style={{
+              width: 4,
+              height: 4,
+              background: i < lit ? "var(--accent)" : "var(--dot-1)",
+            }}
+          />
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 gap-x-5 gap-y-3">
+        <DotSlider
+          label="Work"
+          readout={`${workDuration}m`}
+          value={workDuration}
+          min={1}
+          max={60}
+          segments={10}
+          disabled={isRunning}
+          onChange={(v) => setPhaseDuration(v, false)}
+        />
+        <DotSlider
+          label="Rest"
+          readout={`${breakDuration}m`}
+          value={breakDuration}
+          min={1}
+          max={30}
+          segments={10}
+          disabled={isRunning}
+          onChange={(v) => setPhaseDuration(v, true)}
+        />
       </div>
     </div>
   )
 }
+
+export default PomodoroTimer

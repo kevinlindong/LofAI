@@ -1,3 +1,6 @@
+# Claude
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -7,15 +10,13 @@ venv/
 # macOS
 .DS_Store
 
-# Backend - Generated audio files
-backend/audio/*.mp3
-backend/audio/*.tmp
-
 # Frontend - Next.js
 frontend/.next/
 frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
 frontend/.env.local
 
 # Logs and PIDs
 *.log
 *.pid
+.lofai.lock

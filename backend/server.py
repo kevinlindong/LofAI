@@ -1,53 +1,41 @@
-# fastapi server for lofai music player
+# fastapi server for lofai - one magenta realtime 2 stream per listener
 
-import os
-import sys
-import threading
-from pathlib import Path
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from music_generator import MusicGenerator
-from connection_manager import ConnectionManager
+import engine as engine_mod
+import session_manager as manager_mod
+import styles
 
-# config
-AUDIO_DIR = Path(__file__).parent / "audio"
-AUDIO_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("lofai")
 
-# global state
-current_index = 0
-music_generator = None
-ws_manager = ConnectionManager()
-listener_count = 0
-listener_lock = threading.Lock()
-initial_generation_started = False
+# how much audio we hold for a client that has stopped draining. the lookahead
+# cap means a healthy session never banks more than a few seconds here, so this
+# is insurance against a wedged socket rather than a working buffer.
+OUTBOX_LIMIT = max(4, int(30.0 / manager_mod.CHUNK_SECONDS))
+
+manager = manager_mod.SessionManager()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # initialize and cleanup resources
-    global music_generator, initial_generation_started
-    
-    fal_api_key = os.environ.get("FAL_KEY")
-    if not fal_api_key:
-        print("WARNING: FAL_KEY not set. Music generation will not work.")
-        print("Please set the FAL_KEY environment variable with your fal.ai API key.")
-    else:
-        music_generator = MusicGenerator(fal_api_key)
-        # generate first batch in background
-        if not initial_generation_started:
-            initial_generation_started = True
-            threading.Thread(target=generate_initial_batch, daemon=True).start()
-    
-    yield
+    manager.start()
+    try:
+        yield
+    finally:
+        manager.stop()
 
 
 app = FastAPI(lifespan=lifespan)
 
-# enable cors for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -60,134 +48,166 @@ app.add_middleware(
 )
 
 
-def generate_initial_batch():
-    # generate first batch on startup
-    if not music_generator:
-        return
-    
+def _offer(queue: asyncio.Queue, item):
+    # Never block the worker thread. Return True if queueing would lose PCM so
+    # the socket owner can reconnect instead of concealing a sequence hole.
+    # Control messages are small and worth delivering; report if one evicts
+    # audio for the same reason.
+    if not queue.full():
+        queue.put_nowait(item)
+        return False
+
+    if isinstance(item, bytes):
+        return True
+
     try:
-        print("Generating initial batch of 10 tracks...")
-        music_generator.generate_batch(AUDIO_DIR, 0)
-        print("Initial batch generation complete")
-    except Exception as e:
-        print(f"ERROR: Failed to generate initial music: {e}")
+        removed = queue.get_nowait()
+    except asyncio.QueueEmpty:
+        removed = None
+    queue.put_nowait(item)
+    return isinstance(removed, bytes)
 
 
-def advance_to_next_track():
-    # advance to next track
-    global current_index
-    
-    # advance index sequentially (0-9)
-    previous_index = current_index
-    current_index = (current_index + 1) % 10
-    
-    print(f"Advanced from track {previous_index} to track {current_index}")
-    
-    # generate new batch when looping to 0
-    if music_generator and current_index == 0:
-        threading.Thread(target=generate_next_batch, daemon=True).start()
-    
-    return current_index
-
-
-def generate_next_batch():
-    # generate all 10 audio clips
-    if not music_generator:
-        return
-    
-    try:
-        print("Starting generation of all 10 tracks...")
-        music_generator.generate_batch(AUDIO_DIR, 0)
-        print("Finished generating all 10 tracks")
-        sys.stdout.flush()  # force immediate output
-    except Exception as e:
-        print(f"ERROR: Failed to generate music: {e}")
-        sys.stdout.flush()
-
-
-@app.get("/api/stream")
-async def stream_current_audio(track: int = None):
-    # stream specified audio track
-    track_index = track if track is not None else current_index
-    audio_path = AUDIO_DIR / f"{track_index}.mp3"
-    
-    if not audio_path.exists():
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"error": "Audio not yet generated", "path": str(audio_path)}
-        )
-    
-    return FileResponse(
-        audio_path,
-        media_type="audio/mpeg",
-        headers={
-            "Cache-Control": "no-cache",
-            "Accept-Ranges": "bytes",
-        }
-    )
-
-
-@app.post("/api/update-prompt")
-async def update_prompt(data: dict):
-    # update music generation prompt
-    mood = data.get("mood", "neutral")
-    instruments = data.get("instruments", "guitar")
-    
-    if music_generator:
-        music_generator.update_prompt(mood, instruments)
-    
-    return {"status": "ok", "mood": mood, "instruments": instruments}
-
-
-@app.post("/api/next-track")
-async def next_track():
-    # advance to next track and return index
-    new_index = advance_to_next_track()
-    return {"track": new_index}
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    # handle websocket connections for listener count
-    global listener_count
-    
-    await ws_manager.connect(websocket)
-    await ws_manager.broadcast(str(listener_count))
-    
+async def _drain(websocket: WebSocket, queue: asyncio.Queue):
+    # the one writer for this socket - starlette websockets cannot be sent on
+    # from two tasks at once, so control messages queue behind audio here
     try:
         while True:
-            msg = await websocket.receive_text()
-            
-            if msg == "listening":
-                with listener_lock:
-                    listener_count += 1
-                await ws_manager.broadcast(str(listener_count))
-                
-            elif msg == "paused":
-                with listener_lock:
-                    listener_count = max(0, listener_count - 1)
-                await ws_manager.broadcast(str(listener_count))
-                
-    except Exception:
+            item = await queue.get()
+            if isinstance(item, bytes):
+                await websocket.send_bytes(item)
+            else:
+                await websocket.send_json(item)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+
+
+@app.websocket("/ws/session")
+async def session_socket(websocket: WebSocket):
+    # one socket per listener: json for control, binary frames for pcm audio
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    outbox: asyncio.Queue = asyncio.Queue(maxsize=OUTBOX_LIMIT)
+    closing_for_overflow = False
+    closed = False
+    helper_tasks: set[asyncio.Task] = set()
+
+    async def close_for_overflow():
+        try:
+            await websocket.close(code=1013, reason="audio backlog")
+        except RuntimeError:
+            pass
+
+    def deliver(item):
+        nonlocal closing_for_overflow
+        if closed or closing_for_overflow:
+            return
+        if _offer(outbox, item):
+            # Never resume after silently dropping a middle PCM packet: that
+            # would splice unrelated samples and click. Reconnect/reset is a
+            # clean, recoverable discontinuity for a wedged client.
+            closing_for_overflow = True
+            task = asyncio.create_task(close_for_overflow())
+            helper_tasks.add(task)
+
+    try:
+        hello = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+    except (asyncio.TimeoutError, WebSocketDisconnect, ValueError):
+        await websocket.close(code=1002)
+        return
+
+    if not isinstance(hello, dict):
+        await websocket.close(code=1002)
+        return
+
+    try:
+        session, resumed = manager.attach(
+            hello.get("sessionId"),
+            hello.get("mood", styles.DEFAULT_MOOD),
+            hello.get("instrument", styles.DEFAULT_INSTRUMENT),
+            sink=lambda pcm: loop.call_soon_threadsafe(deliver, pcm),
+            on_status=lambda payload: loop.call_soon_threadsafe(deliver, payload),
+        )
+    except RuntimeError:
+        await websocket.close(code=1013, reason="backend unavailable")
+        return
+    log.info("%s session %s", "resumed" if resumed else "opened", session.id[:8])
+
+    _offer(
+        outbox,
+        {
+            "type": "hello",
+            "sessionId": session.id,
+            "resumed": resumed,
+            "sampleRate": engine_mod.SAMPLE_RATE,
+            "channels": engine_mod.CHANNELS,
+            "chunkSeconds": manager_mod.CHUNK_SECONDS,
+            "mood": session.mood,
+            "instrument": session.instrument,
+        },
+    )
+    _offer(outbox, manager.status_for(session))
+
+    drain = asyncio.create_task(_drain(websocket, outbox))
+    try:
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict):
+                continue
+
+            kind = message.get("type")
+            session.touch()
+
+            if kind == "style":
+                mood, instrument = session.request_style(
+                    message.get("mood", session.mood),
+                    message.get("instrument", session.instrument),
+                )
+                _offer(outbox, {"type": "style", "mood": mood, "instrument": instrument})
+
+            elif kind == "pause":
+                manager.suspend(session, preserve_audio=True)
+
+            elif kind == "resume":
+                manager.resume(session)
+
+            elif kind == "gap":
+                # the client ran its reservoir dry and had to refill. only it
+                # can tell us this - the server has no idea what was audible -
+                # so it is also the one honest input the quality tuner gets.
+                manager.report_gap(session)
+
+            elif kind == "pressure":
+                manager.report_pressure()
+
+            elif kind == "ping":
+                _offer(outbox, {"type": "pong"})
+
+    except (WebSocketDisconnect, ValueError, RuntimeError):
         pass
     finally:
-        with listener_lock:
-            listener_count = max(0, listener_count - 1)
-        ws_manager.disconnect(websocket)
-        await ws_manager.broadcast(str(listener_count))
+        closed = True
+        drain.cancel()
+        session.sink = None
+        session.on_status = None
+        # the state stays warm for MRT_SESSION_TTL so a reconnect or an unpause
+        # picks the same music back up
+        manager.suspend(session)
+        tasks = (drain, *helper_tasks)
+        for task in tasks:
+            task.cancel()
+        # gather retrieves every exception as well as waiting for cancellation;
+        # no helper task can outlive its socket or become an unobserved error.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        log.info("detached session %s", session.id[:8])
 
 
 @app.get("/health")
 async def health_check():
-    # health check endpoint
-    return {
-        "status": "ok",
-        "current_track": current_index,
-        "listeners": listener_count,
-        "generator_ready": music_generator is not None
-    }
+    return {"status": "ok", **manager.stats()}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws_per_message_deflate=False)
