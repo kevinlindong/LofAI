@@ -50,16 +50,20 @@ const HOLD_MS: Record<Reaction, number> = {
   pet: 1400,
 }
 
-// thirty frames a second of a dot matrix reads the same as sixty and leaves the
-// other half of the budget to the music, which on a machine generating that
-// music locally is the whole point. (a few ms under the interval so a 60hz
-// display reliably takes every second frame.)
-const MIN_FRAME_MS = 1000 / 30 - 4
+// every frame the display offers. thirty was the old setting, on the argument
+// that a dot matrix reads the same at half the rate and the other half of the
+// budget belongs to the music. that argument is wrong about the shape changes:
+// the squash, the ear flick and the tail curl are continuous, and at thirty
+// they stutter. building a frame costs a fortieth of a millisecond, so there
+// is nothing to save.
+const MIN_FRAME_MS = 0
 
 // how the head follows the beat, as time constants in seconds: drops fast,
 // comes back up slowly. seconds rather than per-frame fractions so the bob
-// feels the same however often we draw.
-const BOB_ATTACK = 0.033
+// feels the same however often we draw. the attack is a shade slower than it
+// wants to be on paper - the head moves in whole dots, so an attack quick
+// enough to catch every transient just makes it flicker between two rows.
+const BOB_ATTACK = 0.055
 const BOB_RELEASE = 0.27
 
 // how fast the eyes catch up with the cursor. slow enough to be a head turning
@@ -78,7 +82,7 @@ const ATTENTION_MS = 4000
 
 // where the eyes sit in the picture, in dots, for working out what the cursor
 // is off to the side of
-const EYE_C = 19
+const EYE_C = 16
 const EYE_R = 12
 
 // the caption is the other half of the animation. a tamagotchi tells you what
@@ -277,21 +281,29 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
       let sparkle = 0
       let hop = 0
       let twitch = 0
+      let pat = 0
 
       if (reaction) {
         const t = (now - reaction.start) / HOLD_MS[reaction.kind]
+        // reactions are shaped in seconds, not in fractions of their hold: a
+        // twitch is a twitch whether the pose it interrupts lasts half a
+        // second or three
+        const secs = (now - reaction.start) / 1000
         if (t >= 1) {
           reactionRef.current = null
         } else if (reaction.kind === "add" || reaction.kind === "undo") {
           // a task arriving is worth noticing but not celebrating: an ear goes
-          // back, and the loaf lifts off the ground just enough to see
-          twitch = Math.sin(t * Math.PI * 3) > 0 ? 1 : 0
-          hop = Math.max(0, Math.sin(t * Math.PI)) * 0.3
+          // back and comes down again. a decaying wobble rather than a square
+          // wave - an ear that snaps between two positions three times reads
+          // as a fault in the panel.
+          twitch = Math.max(0, Math.exp(-secs * 4) * Math.cos(secs * 13))
         } else if (reaction.kind === "pet") {
-          // being fussed. it shuts its eyes and settles, which is what the
-          // purr mood draws.
+          // being fussed. this used to be a hop, which is what a cat does when
+          // you drop something, not when you put your hand on it. a pat
+          // presses the loaf down into the ground and it springs most of the
+          // way back - the cosine going briefly negative is that rebound.
           mood = "purr"
-          hop = Math.max(0, Math.sin(t * Math.PI)) * 0.25
+          pat = Math.max(-0.35, Math.exp(-secs * 4.5) * Math.cos(secs * 7.5))
         } else {
           mood = reaction.kind === "clear" ? "cheer" : "happy"
           sparkle = 1 - t
@@ -323,6 +335,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         bob: playingRef.current ? Math.min(1, smoothed * 1.6) : 0,
         hop,
         twitch,
+        pat,
         phase: now / 1000,
         notes: playingRef.current,
         sparkle,
@@ -386,7 +399,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         <span className="label">{caption}</span>
       </div>
       <div
-        className="panel-inset mx-auto w-full max-w-[16rem] p-2"
+        className="panel-inset mx-auto w-full max-w-[18rem] p-2"
         style={{ background: "var(--bg)" }}
       >
         {/* the pitch is measured off this, so it carries no padding of its own */}

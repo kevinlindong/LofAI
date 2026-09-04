@@ -39,9 +39,9 @@ const DRIFT: Array<[number, number, number, number]> = [
   [0.09, 0.17, 0.77, 0.55],
 ]
 
-// twenty frames a second. this is wallpaper, and wallpaper does not need the
-// budget the music is using.
-const MIN_FRAME_MS = 1000 / 20 - 4
+// thirty frames a second. this is wallpaper and it moves slowly, but at twenty
+// the blob edges creep across the grid in visible steps.
+const MIN_FRAME_MS = 1000 / 30 - 4
 
 const PALETTE_VARS = ["--dot-0", "--dot-1", "--dot-2", "--dot-3"]
 

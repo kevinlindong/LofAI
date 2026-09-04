@@ -37,11 +37,10 @@ const PEAK_FALL = 0.42
 const ATTACK = 0.028
 const RELEASE = 0.131
 
-// the ring is a slow dot matrix, and thirty frames a second of it is not
-// visibly worse than sixty. on a machine that is also rendering the music,
-// the other thirty are contention that buys nothing. (a few ms under the
-// interval so a 60hz display reliably takes every second frame.)
-const MIN_FRAME_MS = 1000 / 30 - 4
+// every frame the display offers. the wave's edge crawls a fraction of a dot
+// at a time, and at thirty that crawl reads as a stutter. sampling the field
+// over the whole lattice costs a tenth of a millisecond.
+const MIN_FRAME_MS = 0
 
 const TAU = Math.PI * 2
 
