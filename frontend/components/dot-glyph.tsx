@@ -14,6 +14,7 @@ export const GLYPHS = {
   box: ["XXXXX", "X...X", "X...X", "X...X", "XXXXX"],
   check: [".....", "....X", "...X.", "X.X..", ".X..."],
   plus: ["..X..", "..X..", "XXXXX", "..X..", "..X.."],
+  cross: ["X...X", ".X.X.", "..X..", ".X.X.", "X...X"],
 } as const
 
 export type GlyphName = keyof typeof GLYPHS

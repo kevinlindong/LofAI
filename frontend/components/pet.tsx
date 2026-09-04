@@ -10,7 +10,11 @@ import {
   type PetMood,
 } from "@/lib/pet-scene"
 
-export type PetEvent = "add" | "complete" | "clear"
+export type PetEvent = "add" | "complete" | "clear" | "undo"
+
+// what the cat is reacting to. "pet" is not a PetEvent because nothing outside
+// this component raises it - it is the cat noticing that you clicked on it.
+type Reaction = PetEvent | "pet"
 
 export interface PetSignal {
   kind: PetEvent
@@ -38,7 +42,13 @@ const PALETTE_VARS = [
 ]
 
 // how long each reaction holds the cat's face
-const HOLD_MS: Record<PetEvent, number> = { add: 750, complete: 1900, clear: 3200 }
+const HOLD_MS: Record<Reaction, number> = {
+  add: 750,
+  complete: 1900,
+  clear: 3200,
+  undo: 700,
+  pet: 1400,
+}
 
 // thirty frames a second of a dot matrix reads the same as sixty and leaves the
 // other half of the budget to the music, which on a machine generating that
@@ -69,14 +79,19 @@ const ATTENTION_MS = 4000
 // where the eyes sit in the picture, in dots, for working out what the cursor
 // is off to the side of
 const EYE_C = 19
-const EYE_R = 13
+const EYE_R = 12
 
+// the caption is the other half of the animation. a tamagotchi tells you what
+// it is doing in words as well as in pixels, and at forty dots across the
+// words carry more of it than you would like to admit.
 const CAPTIONS: Record<PetMood, string> = {
   sleep: "dozing",
   cheer: "delighted",
   happy: "pleased",
-  focus: "working",
-  idle: "idling",
+  purr: "purring",
+  focus: "keeping watch",
+  bop: "bopping",
+  idle: "loafing",
 }
 
 export function Pet({ signal, focus, playing, getLevel }: PetProps) {
@@ -86,7 +101,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
 
   // everything the animation loop reads lives in refs: the loop runs at frame
   // rate and must never be the reason react re-renders
-  const reactionRef = useRef<{ kind: PetEvent; start: number } | null>(null)
+  const reactionRef = useRef<{ kind: Reaction; start: number } | null>(null)
   const focusRef = useRef(focus)
   const playingRef = useRef(playing)
   const levelRef = useRef(getLevel)
@@ -267,11 +282,16 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         const t = (now - reaction.start) / HOLD_MS[reaction.kind]
         if (t >= 1) {
           reactionRef.current = null
-        } else if (reaction.kind === "add") {
-          // a task arriving is worth noticing but not celebrating: both ears
-          // go back, and the cat lifts off the floor just enough to see
+        } else if (reaction.kind === "add" || reaction.kind === "undo") {
+          // a task arriving is worth noticing but not celebrating: an ear goes
+          // back, and the loaf lifts off the ground just enough to see
           twitch = Math.sin(t * Math.PI * 3) > 0 ? 1 : 0
           hop = Math.max(0, Math.sin(t * Math.PI)) * 0.3
+        } else if (reaction.kind === "pet") {
+          // being fussed. it shuts its eyes and settles, which is what the
+          // purr mood draws.
+          mood = "purr"
+          hop = Math.max(0, Math.sin(t * Math.PI)) * 0.25
         } else {
           mood = reaction.kind === "clear" ? "cheer" : "happy"
           sparkle = 1 - t
@@ -281,10 +301,15 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         }
       }
 
+      // the state it settles into when nothing has just happened to it. the
+      // order is the priority: a hand on the cat beats the pomodoro, the
+      // pomodoro beats the music, and going to sleep needs all three quiet.
       if (mood === "idle") {
         const idleFor = Date.now() - lastPokeRef.current
-        if (focusRef.current) mood = "focus"
-        else if (!playingRef.current && idleFor > 45_000) mood = "sleep"
+        if (affection > 0.55) mood = "purr"
+        else if (focusRef.current) mood = "focus"
+        else if (playingRef.current) mood = "bop"
+        else if (idleFor > 45_000) mood = "sleep"
       }
 
       if (mood !== shownMood) {
@@ -320,6 +345,20 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     const poke = () => {
       lastPokeRef.current = Date.now()
     }
+    // a click on the cat itself, as opposed to a click anywhere on the page
+    const press = (e: PointerEvent) => {
+      poke()
+      const box = canvasRef.current?.getBoundingClientRect()
+      if (!box) return
+      if (
+        e.clientX >= box.left &&
+        e.clientX <= box.right &&
+        e.clientY >= box.top &&
+        e.clientY <= box.bottom
+      ) {
+        reactionRef.current = { kind: "pet", start: performance.now() }
+      }
+    }
     const track = (e: PointerEvent) => {
       pointerRef.current = { x: e.clientX, y: e.clientY, at: Date.now() }
       poke()
@@ -328,13 +367,13 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
       pointerRef.current = null
     }
     window.addEventListener("pointermove", track, { passive: true })
-    window.addEventListener("pointerdown", poke)
+    window.addEventListener("pointerdown", press)
     window.addEventListener("keydown", poke)
     // the cursor leaving the window is not the cursor sitting still somewhere
     document.addEventListener("pointerleave", forget)
     return () => {
       window.removeEventListener("pointermove", track)
-      window.removeEventListener("pointerdown", poke)
+      window.removeEventListener("pointerdown", press)
       window.removeEventListener("keydown", poke)
       document.removeEventListener("pointerleave", forget)
     }
