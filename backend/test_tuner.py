@@ -142,8 +142,17 @@ class FakeEngine:
 m = M.SessionManager(); m.engine = FakeEngine(); m._running = True
 m.report_pressure(); m.report_pressure(); m._apply_feedback()
 check("pressure reports coalesce on worker", m.engine.pressure == 1)
+m._sessions[s.id] = s
 m.report_pressure(); m.report_gap(s); m._apply_feedback()
 check("gap supersedes simultaneous pressure", m.engine.gap == 1 and m.engine.pressure == 1)
+
+# Aggregate model speed must be divided among concurrent listeners when the
+# quality controller decides whether there is real-time headroom.
+e = fresh(); e._seed_cost(0.040 / 1.8); e._active_streams = 2
+per_listener = e.effective_realtime_factor()
+e._retune(7.0)
+check("two listeners tune against per-listener speed", e.codebooks == 11,
+      f"effective {per_listener:.2f}x")
 
 # connected pauses remain valid beyond the detached-session TTL
 paused = S.Session("paused", "neutral", "guitar")
@@ -172,4 +181,7 @@ check("style ramp uses segment midpoints", values[0] < 0.1 and abs(values[1] - 0
 check("style plan preserves frame count", sum(frames for _s, _k, frames in plan) == 25)
 
 print(f"\n{sum(ok)}/{len(ok)} passed")
-sys.exit(0 if all(ok) else 1)
+if __name__ == "__main__":
+    sys.exit(0 if all(ok) else 1)
+if not all(ok):
+    raise AssertionError("standalone tuner checks failed during discovery")

@@ -9,6 +9,7 @@ cd "$SCRIPT_DIR"
 
 MODEL_SIZE="${MRT_MODEL_SIZE:-mrt2_small}"
 MAGENTA_ROOT="${MAGENTA_HOME:-$HOME/Documents/Magenta}/magenta-rt-v2"
+BACKEND_HOST="${LOFAI_BACKEND_HOST:-127.0.0.1}"
 
 echo "Starting lofAI backend..."
 
@@ -31,8 +32,27 @@ source venv/bin/activate
 echo "Installing backend dependencies..."
 pip install -q -r backend/requirements.txt
 
-# Fetch the model assets (a few GB, first run only)
-if [ ! -d "$MAGENTA_ROOT/resources/musiccoca" ]; then
+# Fetch the model assets (a few GB, first run only). Check the files actually
+# consumed by mapped MusicCoCa and SpectroStream; an interrupted/older download
+# can leave the directories present but omit mapper.tflite or codec weights.
+RESOURCES_COMPLETE=1
+for RESOURCE in \
+    resources/musiccoca/spm.model \
+    resources/musiccoca/text_encoder.tflite \
+    resources/musiccoca/mapper.tflite \
+    resources/musiccoca/audio_preprocessor.tflite \
+    resources/musiccoca/music_encoder.tflite \
+    resources/musiccoca/pretrained_vector_quantizer.tflite \
+    resources/spectrostream/quantizer.safetensors \
+    resources/spectrostream/encoder.safetensors \
+    resources/spectrostream/decoder.safetensors; do
+    if [ ! -f "$MAGENTA_ROOT/$RESOURCE" ]; then
+        RESOURCES_COMPLETE=0
+        break
+    fi
+done
+
+if [ "$RESOURCES_COMPLETE" = "0" ]; then
     echo "Downloading shared resources (MusicCoCa + SpectroStream)..."
     mrt models init --source hf
 fi
@@ -55,6 +75,6 @@ if [ "${LOFAI_RELOAD:-0}" = "1" ]; then
     RELOAD_FLAG="--reload"
 fi
 
-echo "Starting backend server on http://localhost:8000"
+echo "Starting backend server on http://$BACKEND_HOST:8000"
 cd backend
-exec python -m uvicorn server:app $RELOAD_FLAG --host 0.0.0.0 --port 8000 --ws-per-message-deflate false
+exec python -m uvicorn server:app $RELOAD_FLAG --host "$BACKEND_HOST" --port 8000 --ws-per-message-deflate false

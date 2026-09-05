@@ -25,12 +25,12 @@ export function ThemeToggle() {
     <button
       type="button"
       onClick={toggle}
-      className="key h-8 px-3 text-[0.7rem]"
+      className="key theme-control"
       style={{ opacity: mounted ? 1 : 0 }}
-      aria-label={isDark ? "Switch to paper" : "Switch to panel"}
+      aria-label={isDark ? "Use light theme" : "Use dark theme"}
     >
       <DotGlyph name={isDark ? "sun" : "moon"} dot={2} />
-      <span className="hidden sm:inline">{isDark ? "paper" : "panel"}</span>
+      <span className="hidden sm:inline">{isDark ? "light" : "dark"}</span>
     </button>
   )
 }

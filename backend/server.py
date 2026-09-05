@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -24,6 +25,37 @@ OUTBOX_LIMIT = max(4, int(30.0 / manager_mod.CHUNK_SECONDS))
 
 manager = manager_mod.SessionManager()
 
+DEFAULT_ORIGINS = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+}
+ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.environ.get(
+        "LOFAI_ALLOWED_ORIGINS", ",".join(sorted(DEFAULT_ORIGINS))
+    ).split(",")
+    if origin.strip()
+}
+
+CONTROL_FIELDS = (
+    "station",
+    "mood",
+    "instrument",
+    "bpm",
+    "groove",
+    "intensity",
+    "melody",
+    "drums",
+)
+
+
+def _music_controls(message: dict) -> dict:
+    return {key: message[key] for key in CONTROL_FIELDS if key in message}
+
+
+def _origin_allowed(origin: str | None) -> bool:
+    return not origin or "*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,10 +70,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=sorted(ALLOWED_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -85,16 +114,31 @@ async def _drain(websocket: WebSocket, queue: asyncio.Queue):
 @app.websocket("/ws/session")
 async def session_socket(websocket: WebSocket):
     # one socket per listener: json for control, binary frames for pcm audio
+    origin = websocket.headers.get("origin")
+    if not _origin_allowed(origin):
+        log.warning("rejected websocket origin %s", origin)
+        await websocket.close(code=1008, reason="origin not allowed")
+        return
     await websocket.accept()
     loop = asyncio.get_running_loop()
     outbox: asyncio.Queue = asyncio.Queue(maxsize=OUTBOX_LIMIT)
     closing_for_overflow = False
     closed = False
     helper_tasks: set[asyncio.Task] = set()
+    session_holder = []
 
     async def close_for_overflow():
         try:
             await websocket.close(code=1013, reason="audio backlog")
+        except RuntimeError:
+            pass
+
+    async def close_for_terminal_error():
+        # Let the single writer flush the JSON error first so the listener sees
+        # the useful model failure rather than only a generic close reason.
+        await asyncio.sleep(0)
+        try:
+            await websocket.close(code=1011, reason="model failed to load")
         except RuntimeError:
             pass
 
@@ -109,6 +153,36 @@ async def session_socket(websocket: WebSocket):
             closing_for_overflow = True
             task = asyncio.create_task(close_for_overflow())
             helper_tasks.add(task)
+
+    def clear_pcm_from_outbox():
+        # A variation acknowledgement is a transport barrier. Old queued PCM
+        # must not sit in front of it, and controls must never silently evict a
+        # binary packet from the middle of the stream.
+        controls = []
+        while True:
+            try:
+                item = outbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(item, bytes):
+                controls.append(item)
+        for item in controls:
+            outbox.put_nowait(item)
+
+    def deliver_epoch(pcm, epoch):
+        loop.call_soon_threadsafe(
+            lambda: session_holder
+            and session_holder[0].deliver_if_current(epoch, deliver, pcm)
+        )
+
+    def deliver_status(payload):
+        def apply_status():
+            deliver(payload)
+            if payload.get("terminal") is True and not closed:
+                task = asyncio.create_task(close_for_terminal_error())
+                helper_tasks.add(task)
+
+        loop.call_soon_threadsafe(apply_status)
 
     try:
         hello = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
@@ -125,16 +199,22 @@ async def session_socket(websocket: WebSocket):
             hello.get("sessionId"),
             hello.get("mood", styles.DEFAULT_MOOD),
             hello.get("instrument", styles.DEFAULT_INSTRUMENT),
-            sink=lambda pcm: loop.call_soon_threadsafe(deliver, pcm),
-            on_status=lambda payload: loop.call_soon_threadsafe(deliver, payload),
+            epoch_sink=deliver_epoch,
+            on_status=deliver_status,
+            station=hello.get("station"),
+            controls=_music_controls(hello),
         )
     except RuntimeError:
-        await websocket.close(code=1013, reason="backend unavailable")
+        failed = bool(getattr(manager.engine, "load_error", None))
+        await websocket.close(
+            code=1011 if failed else 1013,
+            reason="model failed to load" if failed else "backend unavailable",
+        )
         return
+    session_holder.append(session)
     log.info("%s session %s", "resumed" if resumed else "opened", session.id[:8])
 
-    _offer(
-        outbox,
+    deliver(
         {
             "type": "hello",
             "sessionId": session.id,
@@ -142,11 +222,10 @@ async def session_socket(websocket: WebSocket):
             "sampleRate": engine_mod.SAMPLE_RATE,
             "channels": engine_mod.CHANNELS,
             "chunkSeconds": manager_mod.CHUNK_SECONDS,
-            "mood": session.mood,
-            "instrument": session.instrument,
+            **session.control_payload(),
         },
     )
-    _offer(outbox, manager.status_for(session))
+    deliver(manager.status_for(session))
 
     drain = asyncio.create_task(_drain(websocket, outbox))
     try:
@@ -159,11 +238,28 @@ async def session_socket(websocket: WebSocket):
             session.touch()
 
             if kind == "style":
-                mood, instrument = session.request_style(
+                session.request_style(
                     message.get("mood", session.mood),
                     message.get("instrument", session.instrument),
+                    station=message.get("station"),
                 )
-                _offer(outbox, {"type": "style", "mood": mood, "instrument": instrument})
+                deliver({"type": "style", **session.control_payload()})
+
+            elif kind == "controls":
+                session.request_controls(_music_controls(message))
+                deliver({"type": "controls", **session.control_payload()})
+
+            elif kind == "variation":
+                new_id, seed = manager.new_variation(session)
+                clear_pcm_from_outbox()
+                deliver(
+                    {
+                        "type": "variation",
+                        "sessionId": new_id,
+                        "seed": seed,
+                        **session.control_payload(),
+                    },
+                )
 
             elif kind == "pause":
                 manager.suspend(session, preserve_audio=True)
@@ -181,18 +277,21 @@ async def session_socket(websocket: WebSocket):
                 manager.report_pressure()
 
             elif kind == "ping":
-                _offer(outbox, {"type": "pong"})
+                deliver({"type": "pong"})
 
     except (WebSocketDisconnect, ValueError, RuntimeError):
         pass
     finally:
         closed = True
         drain.cancel()
-        session.sink = None
-        session.on_status = None
         # the state stays warm for MRT_SESSION_TTL so a reconnect or an unpause
-        # picks the same music back up
-        manager.suspend(session)
+        # can reuse its identity. Audio/model transport restarts together since
+        # a disconnected browser cannot prove how much queued PCM it heard.
+        manager.detach(
+            session,
+            epoch_sink=deliver_epoch,
+            on_status=deliver_status,
+        )
         tasks = (drain, *helper_tasks)
         for task in tasks:
             task.cancel()
@@ -207,7 +306,18 @@ async def health_check():
     return {"status": "ok", **manager.stats()}
 
 
+@app.get("/music/options")
+async def music_options():
+    """Public station metadata and validated control ranges for clients."""
+    return styles.public_options()
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws_per_message_deflate=False)
+    uvicorn.run(
+        app,
+        host=os.environ.get("LOFAI_BACKEND_HOST", "127.0.0.1"),
+        port=8000,
+        ws_per_message_deflate=False,
+    )

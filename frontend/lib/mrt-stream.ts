@@ -36,6 +36,29 @@ export interface StreamState {
   message: string | null
   // 0..1 progress while filling the reservoir, for the UI
   bufferProgress: number
+  variationPending: boolean
+}
+
+export interface ListenerControls {
+  station: string
+  mood: string
+  instrument: string
+  bpm: number
+  groove: number
+  intensity: number
+  melody: boolean
+  drums: boolean
+}
+
+export const DEFAULT_LISTENER_CONTROLS: ListenerControls = {
+  station: "dusty-beats",
+  mood: "neutral",
+  instrument: "guitar",
+  bpm: 76,
+  groove: 0.62,
+  intensity: 0.42,
+  melody: true,
+  drums: true,
 }
 
 interface Reservoir {
@@ -68,7 +91,21 @@ function reservoirFor(realtimeFactor: number): Reservoir {
 
 const WORKLET_URL = "/mrt-pcm-worklet.js"
 const RING_SECONDS = 45
-const TERMINAL_SERVER_CLOSE_CODES = new Set([1000, 1001, 1012])
+const FATAL_SERVER_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1011])
+const SESSION_MAX_AGE_MS = 4 * 60 * 1000
+
+// The model's PCM is deliberately conservative (typically around -26 dBFS
+// RMS). Lift it slowly, then catch only the occasional peak. A one-second
+// meter and rate-limited gain movement keep the normalizer from following the
+// beat and turning into an audible compressor.
+const LOUDNESS_TARGET_DBFS = -18
+const NORMALIZER_MIN_DB = -3
+const NORMALIZER_MAX_DB = 9
+const NORMALIZER_STEP_UP_DB = 0.35
+const NORMALIZER_STEP_DOWN_DB = 0.75
+const LOUDNESS_POLL_MS = 1000
+const LOUDNESS_SMOOTHING = 0.08
+const MIN_NORMALIZE_POWER = 10 ** (-48 / 10)
 
 class SinkBuildCancelled extends Error {}
 
@@ -83,18 +120,97 @@ function backendHost(): string {
 
 function readSessionId(): string | null {
   try {
-    return window.sessionStorage.getItem(SESSION_KEY)
+    const raw = window.sessionStorage.getItem(SESSION_KEY)
+    if (!raw) return null
+
+    // Plain string IDs predate the timestamped record. They may already refer
+    // to an evicted backend session, so migrate safely by starting one fresh
+    // take instead of replaying the same deterministic seed forever.
+    const stored = JSON.parse(raw) as { version?: unknown; id?: unknown; savedAt?: unknown }
+    if (
+      stored.version !== 1 ||
+      typeof stored.id !== "string" ||
+      !stored.id ||
+      typeof stored.savedAt !== "number" ||
+      Date.now() - stored.savedAt > SESSION_MAX_AGE_MS
+    ) {
+      window.sessionStorage.removeItem(SESSION_KEY)
+      return null
+    }
+    return stored.id
   } catch {
+    try {
+      window.sessionStorage.removeItem(SESSION_KEY)
+    } catch {
+      // private browsing can reject storage access entirely
+    }
     return null
   }
 }
 
 function writeSessionId(id: string) {
   try {
-    window.sessionStorage.setItem(SESSION_KEY, id)
+    if (!id) return
+    window.sessionStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ version: 1, id, savedAt: Date.now() }),
+    )
   } catch {
     // private browsing - the session just won't survive a reload
   }
+}
+
+function clearSessionId() {
+  try {
+    window.sessionStorage.removeItem(SESSION_KEY)
+  } catch {
+    // private browsing - there is no persistent session to clear
+  }
+}
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value))
+}
+
+function normalizedControls(
+  next: Partial<ListenerControls>,
+  previous: ListenerControls = DEFAULT_LISTENER_CONTROLS,
+): ListenerControls {
+  const finite = (value: unknown, fallback: number) =>
+    typeof value === "number" && Number.isFinite(value) ? value : fallback
+  return {
+    station:
+      typeof next.station === "string" && next.station.trim()
+        ? next.station.trim()
+        : previous.station,
+    mood: typeof next.mood === "string" && next.mood ? next.mood : previous.mood,
+    instrument:
+      typeof next.instrument === "string" && next.instrument
+        ? next.instrument
+        : previous.instrument,
+    bpm: Math.round(clamp(finite(next.bpm, previous.bpm), 60, 110)),
+    groove: clamp(finite(next.groove, previous.groove), 0, 1),
+    intensity: clamp(finite(next.intensity, previous.intensity), 0, 1),
+    melody: typeof next.melody === "boolean" ? next.melody : previous.melody,
+    drums: typeof next.drums === "boolean" ? next.drums : previous.drums,
+  }
+}
+
+function controlsEqual(a: ListenerControls, b: ListenerControls): boolean {
+  return (
+    a.station === b.station &&
+    a.mood === b.mood &&
+    a.instrument === b.instrument &&
+    a.bpm === b.bpm &&
+    a.groove === b.groove &&
+    a.intensity === b.intensity &&
+    a.melody === b.melody &&
+    a.drums === b.drums
+  )
+}
+
+function dbToGain(db: number): number {
+  return 10 ** (db / 20)
 }
 
 // what the stream needs from whatever is actually making sound
@@ -347,19 +463,30 @@ export class MrtStream {
   private ctx: AudioContext | null = null
   private sink: PcmSink | null = null
   private sinkReady: Promise<PcmSink> | null = null
+  private inputMeter: AnalyserNode | null = null
+  private normalizer: GainNode | null = null
+  private limiter: DynamicsCompressorNode | null = null
+  private ceiling: GainNode | null = null
   private gain: GainNode | null = null
   private analyser: AnalyserNode | null = null
+  private loudnessBuffer: Float32Array = new Float32Array(0)
   private levelBuffer: Uint8Array = new Uint8Array(0)
   private freqBuffer: Uint8Array = new Uint8Array(0)
+  private loudnessTimer: ReturnType<typeof setInterval> | null = null
+  private smoothedPower: number | null = null
+  private normalizerDb = 0
 
   private sampleRate = 48000
   private channels = 2
 
   private volume = 1
-  private mood = "neutral"
-  private instrument = "guitar"
+  private controls: ListenerControls = { ...DEFAULT_LISTENER_CONTROLS }
   private wantsAudio = false
   private backendActive = false
+  private awaitingVariation = false
+  private requestedSessionId: string | null = null
+  private activeSessionId: string | null = null
+  private lastSessionPersistedAt = 0
   private realtimeFactor = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private suspendTimer: ReturnType<typeof setTimeout> | null = null
@@ -377,22 +504,33 @@ export class MrtStream {
     capacity: 0,
     message: null,
     bufferProgress: 0,
+    variationPending: false,
   }
 
   constructor(private onState: (state: StreamState) => void) {}
 
   // --- public api ---
 
-  async start(mood: string, instrument: string) {
+  async start(controls: ListenerControls): Promise<void>
+  async start(mood: string, instrument: string): Promise<void>
+  async start(controlsOrMood: ListenerControls | string, instrument?: string) {
     if (this.destroyed) return
-    this.mood = mood
-    this.instrument = instrument
+    this.controls =
+      typeof controlsOrMood === "string"
+        ? normalizedControls(
+            {
+              station: "custom",
+              mood: controlsOrMood,
+              instrument: instrument ?? this.controls.instrument,
+            },
+            this.controls,
+          )
+        : normalizedControls(controlsOrMood, this.controls)
     this.wantsAudio = true
     if (this.suspendTimer) {
       clearTimeout(this.suspendTimer)
       this.suspendTimer = null
     }
-
     const ctx = this.ensureContext()
     // browsers start the context suspended until a user gesture; this call is
     // inside the click handler, so it is allowed to resume. it goes before the
@@ -423,6 +561,7 @@ export class MrtStream {
 
   pause() {
     if (this.destroyed) return
+    this.persistSessionId(true)
     this.wantsAudio = false
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
@@ -443,11 +582,64 @@ export class MrtStream {
     this.patch({ status: "paused", bufferProgress: 0 })
   }
 
-  setStyle(mood: string, instrument: string) {
+  setStyle(mood: string, instrument: string, station = "custom") {
     if (this.destroyed) return
-    this.mood = mood
-    this.instrument = instrument
-    this.send({ type: "style", mood, instrument })
+    this.controls = normalizedControls({ mood, instrument, station }, this.controls)
+    this.send({ type: "style", mood, instrument, station })
+  }
+
+  setControls(next: ListenerControls) {
+    if (this.destroyed) return
+    const controls = normalizedControls(next, this.controls)
+    if (controlsEqual(controls, this.controls)) return
+
+    const styleChanged =
+      controls.station !== this.controls.station ||
+      controls.mood !== this.controls.mood ||
+      controls.instrument !== this.controls.instrument
+    this.controls = controls
+
+    // Keep old servers useful during rollout. New servers consume the complete
+    // planner control block; old ones still understand the style message.
+    if (styleChanged) {
+      this.send({
+        type: "style",
+        station: controls.station,
+        mood: controls.mood,
+        instrument: controls.instrument,
+      })
+    }
+    this.send({ type: "controls", ...controls })
+  }
+
+  newVariation() {
+    if (this.destroyed) return
+
+    // Audio and model state on opposite sides of this request must never meet
+    // in the same ring buffer. WebSocket ordering means that after the ack all
+    // following binary packets belong to the new take.
+    clearSessionId()
+    this.requestedSessionId = null
+    this.activeSessionId = null
+    this.pendingPcm = []
+    this.sink?.reset()
+    this.awaitingVariation = true
+    this.patch({
+      status: this.wantsAudio ? "buffering" : "paused",
+      message: null,
+      bufferProgress: 0,
+      variationPending: true,
+    })
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.send({ type: "variation" })
+      return
+    }
+
+    // If hello has not gone out yet, clearing storage is enough: that socket
+    // will request a brand-new session. A disconnected playing stream needs a
+    // fresh connection immediately.
+    if (!this.ws && this.wantsAudio) this.connect()
   }
 
   setVolume(value: number) {
@@ -487,6 +679,7 @@ export class MrtStream {
 
   destroy(): Promise<void> {
     if (this.destroyPromise) return this.destroyPromise
+    this.persistSessionId(true)
     this.destroyed = true
     this.wantsAudio = false
     this.backendActive = false
@@ -499,6 +692,10 @@ export class MrtStream {
     if (this.suspendTimer) {
       clearTimeout(this.suspendTimer)
       this.suspendTimer = null
+    }
+    if (this.loudnessTimer) {
+      clearInterval(this.loudnessTimer)
+      this.loudnessTimer = null
     }
 
     const sink = this.sink
@@ -518,12 +715,23 @@ export class MrtStream {
     }
 
     this.pendingPcm = []
+    this.inputMeter?.disconnect()
+    this.normalizer?.disconnect()
+    this.limiter?.disconnect()
+    this.ceiling?.disconnect()
     this.gain?.disconnect()
     this.analyser?.disconnect()
+    this.inputMeter = null
+    this.normalizer = null
+    this.limiter = null
+    this.ceiling = null
     this.gain = null
     this.analyser = null
+    this.loudnessBuffer = new Float32Array(0)
     this.levelBuffer = new Uint8Array(0)
     this.freqBuffer = new Uint8Array(0)
+    this.smoothedPower = null
+    this.normalizerDb = 0
 
     const ctx = this.ctx
     this.ctx = null
@@ -548,6 +756,28 @@ export class MrtStream {
     // cursor resamples for free on its way out
     const ctx = new AudioContext({ sampleRate: this.sampleRate })
 
+    const inputMeter = ctx.createAnalyser()
+    // Roughly 680ms at 48k. The normalizer polls this only once a second and
+    // smooths power over many polls, so it responds to a quiet master rather
+    // than individual kicks and snares.
+    inputMeter.fftSize = 32768
+    inputMeter.smoothingTimeConstant = 0
+
+    const normalizer = ctx.createGain()
+    normalizer.gain.value = 1
+
+    const limiter = ctx.createDynamicsCompressor()
+    limiter.threshold.value = -2.5
+    limiter.knee.value = 0
+    limiter.ratio.value = 20
+    limiter.attack.value = 0.003
+    limiter.release.value = 0.3
+
+    // The compressor has a short look-ahead in browser implementations; this
+    // final trim leaves another decibel for reconstruction/intersample peaks.
+    const ceiling = ctx.createGain()
+    ceiling.gain.value = dbToGain(-1)
+
     const gain = ctx.createGain()
     gain.gain.value = this.volume
 
@@ -557,15 +787,76 @@ export class MrtStream {
     // ring flickers a whole ring-step between frames
     analyser.smoothingTimeConstant = 0.75
 
+    inputMeter.connect(normalizer)
+    normalizer.connect(limiter)
+    limiter.connect(ceiling)
+    ceiling.connect(gain)
     gain.connect(analyser)
     analyser.connect(ctx.destination)
 
     this.ctx = ctx
+    this.inputMeter = inputMeter
+    this.normalizer = normalizer
+    this.limiter = limiter
+    this.ceiling = ceiling
     this.gain = gain
     this.analyser = analyser
+    this.loudnessBuffer = new Float32Array(inputMeter.fftSize)
     this.levelBuffer = new Uint8Array(analyser.fftSize)
     this.freqBuffer = new Uint8Array(analyser.frequencyBinCount)
+    this.loudnessTimer = setInterval(() => this.updateLoudness(), LOUDNESS_POLL_MS)
     return ctx
+  }
+
+  private updateLoudness() {
+    const meter = this.inputMeter
+    const normalizer = this.normalizer
+    const ctx = this.ctx
+    if (
+      !meter ||
+      !normalizer ||
+      !ctx ||
+      ctx.state !== "running" ||
+      !this.wantsAudio ||
+      !this.backendActive ||
+      this.awaitingVariation
+    ) {
+      return
+    }
+
+    if (this.loudnessBuffer.length !== meter.fftSize) {
+      this.loudnessBuffer = new Float32Array(meter.fftSize)
+    }
+    meter.getFloatTimeDomainData(this.loudnessBuffer)
+    let power = 0
+    for (let i = 0; i < this.loudnessBuffer.length; i++) {
+      const sample = this.loudnessBuffer[i]
+      power += sample * sample
+    }
+    power /= this.loudnessBuffer.length
+
+    // Do not chase pauses, dropouts, or a sparse intro up to maximum gain.
+    if (!Number.isFinite(power) || power < MIN_NORMALIZE_POWER) return
+    this.smoothedPower =
+      this.smoothedPower === null
+        ? power
+        : this.smoothedPower * (1 - LOUDNESS_SMOOTHING) + power * LOUDNESS_SMOOTHING
+
+    const measuredDb = 10 * Math.log10(this.smoothedPower)
+    const wantedDb = clamp(
+      LOUDNESS_TARGET_DBFS - measuredDb,
+      NORMALIZER_MIN_DB,
+      NORMALIZER_MAX_DB,
+    )
+    const delta = clamp(
+      wantedDb - this.normalizerDb,
+      -NORMALIZER_STEP_DOWN_DB,
+      NORMALIZER_STEP_UP_DB,
+    )
+    if (Math.abs(delta) < 0.01) return
+
+    this.normalizerDb += delta
+    normalizer.gain.setTargetAtTime(dbToGain(this.normalizerDb), ctx.currentTime, 3)
   }
 
   private ensureSink(): Promise<PcmSink> {
@@ -632,11 +923,11 @@ export class MrtStream {
       sink.configure(reservoir)
     }
 
-    if (!isCurrent() || !this.gain) {
+    if (!isCurrent() || !this.inputMeter) {
       sink.dispose()
       throw new SinkBuildCancelled("sink build was superseded")
     }
-    sink.output.connect(this.gain)
+    sink.output.connect(this.inputMeter)
     // Status may have arrived while the worklet module was compiling.
     sink.configure(reservoirFor(this.realtimeFactor))
     this.sink = sink
@@ -664,6 +955,7 @@ export class MrtStream {
   private onSinkReport(report: SinkReport) {
     if (!this.wantsAudio) return
     if (!this.backendActive) return
+    this.persistSessionId()
     // Let the tuner recover while audio remains instead of waiting until the
     // listener hears a gap. Reports are frequent, so match the server's dwell.
     if (report.playing && report.buffered < 0.75) {
@@ -689,6 +981,7 @@ export class MrtStream {
   }
 
   private enqueue(pcm: ArrayBuffer) {
+    if (this.awaitingVariation) return
     const sink = this.sink
     if (!sink) {
       // Normally the worklet is ready before the model's first second. Keep a
@@ -727,11 +1020,11 @@ export class MrtStream {
     ws.onopen = () => {
       if (this.destroyed || this.ws !== ws) return
       this.reconnectDelay = 500
+      this.requestedSessionId = readSessionId()
       this.send({
         type: "hello",
-        sessionId: readSessionId(),
-        mood: this.mood,
-        instrument: this.instrument,
+        sessionId: this.requestedSessionId,
+        ...this.controls,
       })
       if (!this.wantsAudio) this.send({ type: "pause" })
     }
@@ -754,11 +1047,24 @@ export class MrtStream {
       if (this.destroyed || this.ws !== ws) return
       this.ws = null
       this.backendActive = false
-      if (event.code === 1013) this.sink?.reset()
+      // The server restarts model state after every detached transport because
+      // neither side can know how much in-flight PCM reached the speaker. Keep
+      // the browser ring on the same boundary for all close codes, not only an
+      // explicit backlog close.
+      this.sink?.reset()
       this.pendingPcm = []
-      if (TERMINAL_SERVER_CLOSE_CODES.has(event.code)) {
-        this.patch({ status: "idle", message: "application stopped", bufferProgress: 0 })
-        void this.destroy()
+      if (FATAL_SERVER_CLOSE_CODES.has(event.code)) {
+        this.wantsAudio = false
+        this.activeSessionId = null
+        clearSessionId()
+        this.patch({
+          status: "error",
+          message:
+            this.state.status === "error" && this.state.message
+              ? this.state.message
+              : event.reason || "the backend rejected this connection",
+          bufferProgress: 0,
+        })
         return
       }
       if (!this.wantsAudio) {
@@ -777,10 +1083,21 @@ export class MrtStream {
   private handleControl(message: Record<string, unknown>) {
     switch (message.type) {
       case "hello": {
-        const id = message.sessionId as string
-        writeSessionId(id)
+        const id = typeof message.sessionId === "string" ? message.sessionId : ""
+        const resumed = message.resumed === true
+        // Older servers reused a missing/expired ID for a newly seeded session.
+        // Ask the upgraded server for a genuinely fresh identity if that stale
+        // echo is ever observed.
+        const staleEcho = !resumed && !!this.requestedSessionId && id === this.requestedSessionId
+        if (staleEcho) {
+          this.activeSessionId = null
+          clearSessionId()
+        } else {
+          this.activeSessionId = id || null
+          this.persistSessionId(true)
+        }
 
-        if (message.resumed === false && this.sink) {
+        if (!resumed && this.sink) {
           // The backend could not continue the prior state (or this is the
           // first session). Fade/reset before accepting an unrelated stream.
           this.sink.reset()
@@ -796,6 +1113,37 @@ export class MrtStream {
         this.sampleRate = rate
         this.channels = channels
         if (moved && this.sink) void this.rebuildSink()
+
+        if (staleEcho && this.ws?.readyState === WebSocket.OPEN) {
+          this.awaitingVariation = true
+          this.patch({ variationPending: true, status: "buffering", bufferProgress: 0 })
+          this.send({ type: "variation" })
+        } else if (this.awaitingVariation) {
+          // A variation requested while the socket was still connecting became
+          // a fresh null-session hello rather than an in-place reset.
+          this.awaitingVariation = false
+          this.patch({ variationPending: false })
+        }
+        this.requestedSessionId = null
+        break
+      }
+
+      case "variation": {
+        const id = typeof message.sessionId === "string" ? message.sessionId : ""
+        this.activeSessionId = id || null
+        this.persistSessionId(true)
+        this.requestedSessionId = null
+        this.awaitingVariation = false
+        this.pendingPcm = []
+        this.smoothedPower = null
+        this.sink?.reset()
+        if (this.wantsAudio) this.sink?.play(true)
+        this.patch({
+          status: this.wantsAudio ? "buffering" : "paused",
+          message: null,
+          bufferProgress: 0,
+          variationPending: false,
+        })
         break
       }
 
@@ -803,6 +1151,8 @@ export class MrtStream {
         const backendState = message.state as string
         const wasActive = this.backendActive
         this.backendActive = backendState === "active"
+        const preserveGenerationError =
+          this.state.status === "error" && !this.backendActive && !this.awaitingVariation
 
         const factor = (message.realtimeFactor as number) ?? 0
         if (factor > 0 && Math.abs(factor - this.realtimeFactor) > 0.05) {
@@ -822,7 +1172,11 @@ export class MrtStream {
         }
 
         let status: StreamStatus
-        if (this.backendActive) {
+        if (preserveGenerationError) {
+          status = "error"
+        } else if (this.awaitingVariation) {
+          status = "buffering"
+        } else if (this.backendActive) {
           // the backend is generating for us; what the listener hears depends
           // on whether we have banked enough to play
           status = !this.wantsAudio
@@ -843,13 +1197,24 @@ export class MrtStream {
           queuePosition: (message.position as number) ?? 0,
           listeners: (message.listeners as number) ?? 0,
           capacity: (message.capacity as number) ?? 0,
-          message: (message.error as string) ?? null,
+          message: preserveGenerationError
+            ? this.state.message
+            : ((message.error as string) ?? null),
         })
         break
       }
 
       case "error": {
-        this.patch({ status: "error", message: message.message as string })
+        this.wantsAudio = false
+        this.backendActive = false
+        this.awaitingVariation = false
+        this.pendingPcm = []
+        this.sink?.reset()
+        this.patch({
+          status: "error",
+          message: message.message as string,
+          variationPending: false,
+        })
         break
       }
     }
@@ -859,6 +1224,14 @@ export class MrtStream {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload))
     }
+  }
+
+  private persistSessionId(force = false) {
+    if (!this.activeSessionId) return
+    const now = Date.now()
+    if (!force && now - this.lastSessionPersistedAt < 60_000) return
+    writeSessionId(this.activeSessionId)
+    this.lastSessionPersistedAt = now
   }
 
   private patch(next: Partial<StreamState>) {
@@ -875,7 +1248,8 @@ export class MrtStream {
       merged.listeners === current.listeners &&
       merged.capacity === current.capacity &&
       merged.message === current.message &&
-      merged.bufferProgress === current.bufferProgress
+      merged.bufferProgress === current.bufferProgress &&
+      merged.variationPending === current.variationPending
     ) {
       return
     }

@@ -398,10 +398,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         <span className="label">Companion</span>
         <span className="label">{caption}</span>
       </div>
-      <div
-        className="panel-inset mx-auto w-full max-w-[18rem] p-2"
-        style={{ background: "var(--bg)" }}
-      >
+      <div className="pet-stage mx-auto w-full max-w-[18rem] p-2">
         {/* the pitch is measured off this, so it carries no padding of its own */}
         <div ref={wrapRef} className="flex justify-center">
           <canvas ref={canvasRef} aria-hidden />

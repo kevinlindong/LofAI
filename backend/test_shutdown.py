@@ -131,6 +131,30 @@ class BlockingGenerateEngine:
         self.closed.set()
 
 
+class FailingLoadEngine:
+    ready = False
+    load_error = None
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+
+    def prepare_start(self):
+        pass
+
+    def request_stop(self):
+        self.release.set()
+
+    def load(self):
+        self.entered.set()
+        self.release.wait()
+        raise RuntimeError("broken model fixture")
+
+    def close(self):
+        self.closed.set()
+
+
 class ShutdownTests(unittest.TestCase):
     def test_lifespan_stops_manager_when_the_application_raises(self):
         fake = LifespanManager()
@@ -239,6 +263,27 @@ class ShutdownTests(unittest.TestCase):
         # either case a final stop must leave no worker behind.
         manager.stop()
         self.assertIsNone(manager._worker)
+
+    def test_load_failure_notifies_attached_clients_as_terminal(self):
+        manager = SessionManager()
+        engine = FailingLoadEngine()
+        manager.engine = engine
+        manager.start()
+        self.assertTrue(engine.entered.wait(1))
+        statuses = []
+        manager.attach(None, "neutral", "guitar", on_status=statuses.append)
+
+        engine.release.set()
+        manager._worker.join(1)
+
+        self.assertFalse(manager._worker.is_alive())
+        self.assertTrue(engine.closed.is_set())
+        self.assertTrue(statuses)
+        self.assertEqual(statuses[-1]["type"], "error")
+        self.assertTrue(statuses[-1]["terminal"])
+        self.assertIn("broken model fixture", statuses[-1]["message"])
+        self.assertEqual(manager._sessions, {})
+        manager.stop()
 
 
 if __name__ == "__main__":

@@ -1,157 +1,173 @@
-"""A restrained symbolic melody guide for Magenta RealTime 2.
+"""MRT2 melody compatibility layer backed by the composition planner.
 
-MRT2 can invent an arrangement from a text style on its own, but text does not
-guarantee that the foreground contains a melody.  The model also accepts a
-128-pitch piano-roll every 40 ms.  This module supplies that native control
-signal: one scale-bound lead note at a time, with rests, cadences, and small
-phrase variations.  The model remains responsible for performance, harmony,
-sound design, and the rest of the arrangement.
+New integrations should call :meth:`MelodyGuide.plan_events`.  It returns
+frame-accurate :class:`composition.PianoRollEvent` objects with explicit onset,
+sustain, and release tokens.  The older :meth:`MelodyGuide.plan` and
+``piano_roll(int)`` surfaces remain available so existing callers continue to
+work while they migrate.
 """
 
 from __future__ import annotations
 
-import hashlib
-import random
+from collections.abc import Sequence
+
+from composition import (
+    FRAME_RATE,
+    GuideMode,
+    KEY_ROOTS,
+    MOOD_BPMS,
+    PHRASE_STEPS,
+    PianoRollEvent,
+    PianoRollRun,
+    PlannerSettings,
+    SCALES,
+    STEPS_PER_BEAT,
+    CompositionPlanner,
+    stable_seed,
+)
 
 
-FRAME_RATE = 25
-TEMPO_BPM = 78.0
-STEPS_PER_BEAT = 2
-PHRASE_STEPS = 32  # four bars of eighth-note slots in 4/4
-
-# Scale degrees include the octave so every generated variation stays tonal.
-SCALES = {
-    "somber": (0, 2, 3, 5, 7, 8, 10, 12),       # natural minor
-    "neutral": (0, 2, 4, 5, 7, 9, 11, 12),      # major
-    "lively": (0, 2, 4, 5, 7, 9, 11, 12),       # major
-}
-
-# These are deliberately singable rather than busy.  Each item is a scale
-# degree or None for a rest; the last bar always resolves to the tonic.
-PATTERNS = {
-    "somber": (
-        0, None, None, 2, 3, None, 2, None,
-        5, None, 4, 3, 2, None, 0, None,
-        3, None, 4, 5, 4, None, 2, None,
-        1, 2, 4, None, 2, 1, 0, None,
-    ),
-    "neutral": (
-        0, None, 1, 2, 4, None, 2, 1,
-        5, None, 4, 2, 1, None, 0, None,
-        3, None, 4, 5, 4, 2, 1, None,
-        1, 2, 4, None, 2, 1, 0, None,
-    ),
-    "lively": (
-        0, 1, 2, None, 4, 2, 1, 2,
-        5, 4, 2, None, 1, 2, 4, None,
-        4, 5, 6, 5, 4, 2, 1, None,
-        1, 2, 4, 2, 1, None, 0, None,
-    ),
-}
-
-# A short release between slots keeps the guide articulated and leaves MRT2
-# room to phrase the line naturally.
-GATE_FRACTION = {
-    "somber": 0.72,
-    "neutral": 0.78,
-    "lively": 0.68,
-}
-
-TONICS = (57, 60, 62, 65)  # A3, C4, D4, F4
+# Compatibility names retained for code that imported the original helper's
+# constants.  Tempo is now mood-sensitive; this is the neutral default.
+TEMPO_BPM = MOOD_BPMS["neutral"]
+TONICS = tuple(root + 24 for root in KEY_ROOTS)
 
 
 def _stable_seed(value: str) -> int:
-    digest = hashlib.blake2s(value.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, "big")
+    return stable_seed(value)
 
 
 class MelodyGuide:
-    """Produce a continuous, deterministic note plan for one session."""
+    """One session's shared harmony/melody/section/drum planner."""
 
-    def __init__(self, session_id: str):
-        self.seed = _stable_seed(session_id)
-        self.tonic = TONICS[self.seed % len(TONICS)]
-        self.frame_index = 0
-        self._active_mood = "neutral"
-        self._pending_mood = "neutral"
-        self._last_step = -1
-        self._phrases: dict[tuple[str, int], tuple[int | None, ...]] = {}
+    def __init__(self, session_id: str, *, settings: PlannerSettings | None = None):
+        self.composition = CompositionPlanner(session_id, settings=settings)
+        self.seed = self.composition.seed
+        # Legacy callers understand tonic as the melody register rather than
+        # the lower harmony root exposed by ``composition.key_root``.
+        self.tonic = self.composition.key_root + 24
+
+    @property
+    def frame_index(self) -> int:
+        return self.composition.frame_index
+
+    @property
+    def _active_mood(self) -> str:
+        return self.composition.active_settings.mood
+
+    @property
+    def _pending_mood(self) -> str:
+        return self.composition.settings.mood
+
+    def configure(self, **controls) -> PlannerSettings:
+        """Update controls in place, accepting both wire and internal names."""
+
+        # MusicControls and the websocket protocol expose the concise
+        # ``melody``/``drums`` names.  Keep the planner's explicit dataclass
+        # field names without forcing every integration point to translate.
+        if "melody" in controls:
+            controls.setdefault("melody_enabled", controls.pop("melody"))
+        if "drums" in controls:
+            controls.setdefault("drums_enabled", controls.pop("drums"))
+        # Instrument selects the audio/text style in Session; it does not alter
+        # the symbolic clock.  Accepting it here lets callers pass the complete
+        # listener-control payload without a brittle filtering step.
+        controls.pop("instrument", None)
+        return self.composition.configure(**controls)
+
+    update = configure
+
+    def plan_events(self, mood: str | None, frames: int) -> list[PianoRollRun]:
+        """Return ``(PianoRollEvent, frames)`` runs for direct MRT2 input."""
+
+        return self.composition.plan(mood, frames)
+
+    def event_frames(self, mood: str | None, frames: int) -> list[PianoRollEvent]:
+        """Return uncompressed events when callers need exact clock metadata."""
+
+        return self.composition.plan_frames(mood, frames)
 
     def plan(self, mood: str, frames: int) -> list[tuple[int | None, int]]:
-        """Return ``(midi note or None, frames)`` runs for the next frames."""
-        if frames <= 0:
-            return []
+        """Legacy monophonic ``(MIDI note or None, frames)`` plan.
 
-        self._pending_mood = mood if mood in PATTERNS else "neutral"
+        This view deliberately drops chord, drum, onset, sustain, and release
+        information.  It keeps the current session integration operational, but
+        ``plan_events`` is required to receive the composition overhaul.
+        """
+
+        events = self.event_frames(mood, frames)
         runs: list[tuple[int | None, int]] = []
-        for _ in range(frames):
-            step_position = (
-                self.frame_index * TEMPO_BPM * STEPS_PER_BEAT
-                / (FRAME_RATE * 60.0)
-            )
-            step = int(step_position)
-            if step != self._last_step:
-                # A control change lands on the next eighth-note boundary, so
-                # it cannot cut a held guide note in half.
-                self._active_mood = self._pending_mood
-                self._last_step = step
-
-            phase = step_position - step
-            note = self._note_for_step(self._active_mood, step)
-            if phase >= GATE_FRACTION[self._active_mood]:
-                note = None
-
+        for event in events:
+            note = event.melody_note
             if runs and runs[-1][0] == note:
-                old_note, length = runs[-1]
-                runs[-1] = (old_note, length + 1)
+                previous, length = runs[-1]
+                runs[-1] = (previous, length + 1)
             else:
                 runs.append((note, 1))
-            self.frame_index += 1
         return runs
 
-    def _note_for_step(self, mood: str, step: int) -> int | None:
-        phrase_index, phrase_step = divmod(step, PHRASE_STEPS)
-        degrees = self._phrase(mood, phrase_index)
-        degree = degrees[phrase_step]
-        if degree is None:
-            return None
-        return self.tonic + SCALES[mood][degree]
-
     def _phrase(self, mood: str, phrase_index: int) -> tuple[int | None, ...]:
-        key = (mood, phrase_index)
-        cached = self._phrases.get(key)
-        if cached is not None:
-            return cached
+        """Compatibility/debug view of the varied two-bar motif degrees."""
 
-        degrees = list(PATTERNS[mood])
-        # Keep every fourth phrase as the recognizable theme.  The intervening
-        # phrases receive a few seeded neighbouring scale tones, preserving
-        # contour and cadence while avoiding an obvious short loop.
-        if phrase_index % 4:
-            rng = random.Random(self.seed ^ _stable_seed(f"{mood}:{phrase_index}"))
-            for index in range(1, PHRASE_STEPS - 4):
-                degree = degrees[index]
-                if degree is None or index % 8 == 0 or rng.random() >= 0.14:
-                    continue
-                direction = -1 if rng.random() < 0.5 else 1
-                degrees[index] = max(0, min(7, degree + direction))
-
-        result = tuple(degrees)
-        self._phrases[key] = result
-        return result
+        return self.composition.phrase_degrees(mood, phrase_index)
 
 
-def piano_roll(note: int | None) -> list[int] | None:
-    """Encode one guide note using MRT2's permissive active-note token.
+def piano_roll(
+    value: int | PianoRollEvent | Sequence[int] | None,
+) -> list[int] | None:
+    """Return a validated MRT2 128-pitch piano roll.
 
-    Other pitches stay masked instead of being forced off.  That matches the
-    official live MIDI path and lets the model build chords and accompaniment
-    around the monophonic lead.
+    ``PianoRollEvent`` and 128-token sequences preserve exact ``-1/0/1/2``
+    events from the new planner.  Passing an integer retains the old Auto-Strum
+    behavior (token ``3``) for compatibility.  ``None`` remains fully
+    unconstrained and omits the notes input in the current engine.
     """
-    if note is None:
+
+    if value is None:
         return None
-    if not 0 <= note < 128:
-        raise ValueError(f"MIDI note out of range: {note}")
-    tokens = [-1] * 128
-    tokens[note] = 3  # active; MRT2 may render it as onset or continuation
-    return tokens
+    if isinstance(value, PianoRollEvent):
+        return list(value.tokens)
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not 0 <= value < 128:
+            raise ValueError(f"MIDI note out of range: {value}")
+        tokens = [-1] * 128
+        tokens[value] = 3
+        return tokens
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        tokens = list(value)
+        if len(tokens) != 128:
+            raise ValueError(f"MRT piano roll must have 128 tokens, got {len(tokens)}")
+        if any(token not in (-1, 0, 1, 2, 3) for token in tokens):
+            raise ValueError("MRT piano-roll tokens must be in -1..3")
+        return tokens
+    raise TypeError("expected a MIDI note, PianoRollEvent, 128-token sequence, or None")
+
+
+def drum_intent(value: PianoRollEvent | int | None) -> int | None:
+    """Extract/validate the optional one-channel MRT drum control."""
+
+    if value is None:
+        return None
+    drum = value.drum if isinstance(value, PianoRollEvent) else value
+    if drum not in (-1, 0, 1):
+        raise ValueError("MRT drum intent must be -1, 0, or 1")
+    return int(drum)
+
+
+__all__ = [
+    "CompositionPlanner",
+    "FRAME_RATE",
+    "GuideMode",
+    "MelodyGuide",
+    "MOOD_BPMS",
+    "PHRASE_STEPS",
+    "PianoRollEvent",
+    "PianoRollRun",
+    "PlannerSettings",
+    "SCALES",
+    "STEPS_PER_BEAT",
+    "TEMPO_BPM",
+    "TONICS",
+    "drum_intent",
+    "piano_roll",
+]

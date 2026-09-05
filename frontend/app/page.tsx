@@ -1,13 +1,18 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { DotAmbience } from "@/components/dot-ambience"
+import { MetaballField } from "@/components/metaball-field"
 import { MusicControls } from "@/components/music-controls"
 import { Pet, type PetEvent, type PetSignal } from "@/components/pet"
 import { PomodoroTimer } from "@/components/pomodoro-timer"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { TodoList } from "@/components/todo-list"
-import { MrtStream, type StreamState } from "@/lib/mrt-stream"
+import {
+  DEFAULT_LISTENER_CONTROLS,
+  MrtStream,
+  type ListenerControls,
+  type StreamState,
+} from "@/lib/mrt-stream"
 
 const IDLE_STATE: StreamState = {
   status: "idle",
@@ -16,12 +21,8 @@ const IDLE_STATE: StreamState = {
   capacity: 0,
   message: null,
   bufferProgress: 0,
+  variationPending: false,
 }
-
-const getMoodText = (value: number) => (value < 25 ? "somber" : value < 75 ? "neutral" : "lively")
-
-const getInstrumentType = (value: number) =>
-  value < 25 ? "piano" : value < 75 ? "guitar" : "brass"
 
 // the header carries the connection state; the transport carries the detail
 const SHORT_STATUS: Record<string, string> = {
@@ -36,6 +37,7 @@ const SHORT_STATUS: Record<string, string> = {
 }
 
 function statusLabel(state: StreamState, wantsAudio: boolean): string {
+  if (state.variationPending) return "finding a new take"
   switch (state.status) {
     case "loading":
       return state.message ?? "warming up the model"
@@ -61,8 +63,9 @@ function statusLabel(state: StreamState, wantsAudio: boolean): string {
 }
 
 export default function LofiGenerator() {
-  const [mood, setMood] = useState(50)
-  const [instrument, setInstrument] = useState(50)
+  const [controls, setControls] = useState<ListenerControls>(() => ({
+    ...DEFAULT_LISTENER_CONTROLS,
+  }))
   const [volume, setVolume] = useState(100)
   const [wantsAudio, setWantsAudio] = useState(false)
   const [streamState, setStreamState] = useState<StreamState>(IDLE_STATE)
@@ -70,8 +73,6 @@ export default function LofiGenerator() {
   const [focusMode, setFocusMode] = useState(false)
   const streamRef = useRef<MrtStream | null>(null)
 
-  const moodText = getMoodText(mood)
-  const instrumentText = getInstrumentType(instrument)
   const isLive = streamState.status === "live"
 
   useEffect(() => {
@@ -83,14 +84,22 @@ export default function LofiGenerator() {
     }
   }, [])
 
-  // steer the running stream the moment the slider crosses into a new setting
+  // The stream retains this state before connecting, then sends the complete
+  // planner block whenever a listener changes a control.
   useEffect(() => {
-    streamRef.current?.setStyle(moodText, instrumentText)
-  }, [moodText, instrumentText])
+    streamRef.current?.setControls(controls)
+  }, [controls])
 
   useEffect(() => {
     streamRef.current?.setVolume(volume / 100)
   }, [volume])
+
+  // A generation failure stops the stream internally. Reflect that transport
+  // state in React so the next click is a genuine retry instead of another
+  // pause request against an already suspended backend session.
+  useEffect(() => {
+    if (streamState.status === "error" && wantsAudio) setWantsAudio(false)
+  }, [streamState.status, wantsAudio])
 
   const togglePlayback = useCallback(async () => {
     const stream = streamRef.current
@@ -103,8 +112,12 @@ export default function LofiGenerator() {
     }
 
     setWantsAudio(true)
-    await stream.start(getMoodText(mood), getInstrumentType(instrument))
-  }, [wantsAudio, mood, instrument])
+    await stream.start(controls)
+  }, [wantsAudio, controls])
+
+  const requestVariation = useCallback(() => {
+    streamRef.current?.newVariation()
+  }, [])
 
   const getLevel = useCallback(() => streamRef.current?.level() ?? 0, [])
   const getSpectrum = useCallback(
@@ -119,32 +132,36 @@ export default function LofiGenerator() {
   const label = useMemo(() => statusLabel(streamState, wantsAudio), [streamState, wantsAudio])
 
   return (
-    <main className="min-h-screen p-3 sm:p-6 flex items-center justify-center">
-      <div className="panel w-full max-w-6xl overflow-hidden">
-        <DotAmbience getLevel={getLevel} playing={isLive} />
+    <main className="site-shell">
+      <MetaballField getLevel={getLevel} playing={isLive} />
 
-        <header className="relative z-10 flex items-center justify-between gap-4 border-b px-5 py-3">
-          <div className="flex items-baseline gap-4 min-w-0">
-            {/* uppercase on purpose: a lowercase l is indistinguishable from a 1 here */}
-            <h1 style={{ fontSize: "1.35rem", letterSpacing: "0.2em" }}>LOFAI</h1>
-            <p className="label hidden sm:block truncate">endless lofi, steered as it plays</p>
+      <div className="app-frame">
+        <header className="app-header">
+          <div className="brand-lockup min-w-0">
+            <div className="brand-flow" aria-hidden>
+              <span />
+              <span />
+              <span />
+            </div>
+            <div className="min-w-0">
+              <h1 className="brand-name dot-type">LOFAI</h1>
+              <p className="brand-tagline hidden sm:block">endless lofi, shaped while it plays</p>
+            </div>
           </div>
 
-          <div className="flex items-center gap-4 shrink-0">
-            <span className="flex items-center gap-2">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+            <span className="status-pill">
               <span
-                className={`rounded-full ${isLive ? "animate-dot-blink" : ""}`}
+                className={`status-orb ${isLive ? "is-live" : ""}`}
                 style={{
-                  width: 7,
-                  height: 7,
                   background: isLive
                     ? "var(--good)"
                     : streamState.status === "error"
                       ? "var(--bad)"
-                      : "var(--dot-1)",
+                      : "var(--text-faint)",
                 }}
               />
-              <span className="label hidden sm:inline">
+              <span className="hidden sm:inline">
                 {SHORT_STATUS[streamState.status] ?? "standby"}
               </span>
             </span>
@@ -152,45 +169,48 @@ export default function LofiGenerator() {
           </div>
         </header>
 
-        <div className="relative z-10 grid lg:grid-cols-[1.1fr_1fr]">
-          <section className="border-b lg:border-b-0 lg:border-r">
+        <div className="workspace-grid">
+          <section className="surface-card music-card">
+            <div className="card-intro">
+              <div>
+                <p className="eyebrow">Generative radio</p>
+                <h2>Find your flow.</h2>
+              </div>
+              <p className="card-note hidden sm:block">A live soundtrack that changes with you.</p>
+            </div>
             <MusicControls
               isPlaying={wantsAudio}
               togglePlayback={togglePlayback}
-              mood={mood}
-              setMood={setMood}
-              instrument={instrument}
-              setInstrument={setInstrument}
+              requestVariation={requestVariation}
+              variationPending={streamState.variationPending}
+              controls={controls}
+              setControls={setControls}
               volume={volume}
               setVolume={setVolume}
               statusLabel={label}
-              moodText={moodText}
-              instrumentText={instrumentText}
               isLive={isLive}
               getSpectrum={getSpectrum}
             />
           </section>
 
-          <section className="flex flex-col">
-            <div className="border-b px-5 py-4">
+          <div className="side-stack">
+            <section className="surface-card companion-card">
               <Pet
                 signal={petSignal}
                 focus={focusMode}
                 playing={isLive}
                 getLevel={getLevel}
               />
-            </div>
+            </section>
 
-            {/* the tasks take whatever the cat has left over, which is what
-                keeps the two columns the same height */}
-            <div className="flex min-h-[16rem] flex-1 flex-col border-b px-5 py-4">
+            <section className="surface-card tasks-card">
               <TodoList onEvent={handlePetEvent} />
-            </div>
+            </section>
 
-            <div className="px-5 py-4">
+            <section className="surface-card timer-card">
               <PomodoroTimer onRunningChange={setFocusMode} />
-            </div>
-          </section>
+            </section>
+          </div>
         </div>
       </div>
     </main>

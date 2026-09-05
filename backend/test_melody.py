@@ -1,4 +1,4 @@
-"""Deterministic musical-structure checks for the MRT2 melody guide."""
+"""Compatibility and adapter checks for the MRT2 melody surface."""
 
 import os
 import sys
@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import melody  # noqa: E402
+from composition import PianoRollEvent  # noqa: E402
 
 
 def expand(runs):
@@ -16,8 +17,8 @@ def expand(runs):
     return values
 
 
-class MelodyGuideTests(unittest.TestCase):
-    def test_chunking_does_not_change_the_phrase(self):
+class MelodyGuideCompatibilityTests(unittest.TestCase):
+    def test_legacy_plan_is_deterministic_and_chunk_independent(self):
         whole = expand(melody.MelodyGuide("same-session").plan("neutral", 500))
         split_guide = melody.MelodyGuide("same-session")
         split = expand(split_guide.plan("neutral", 137))
@@ -25,43 +26,19 @@ class MelodyGuideTests(unittest.TestCase):
         split += expand(split_guide.plan("neutral", 152))
 
         self.assertEqual(split, whole)
+        self.assertTrue(any(note is not None for note in whole))
 
-    def test_every_mood_is_tonal_restrained_and_resolving(self):
-        for mood, scale in melody.SCALES.items():
-            guide = melody.MelodyGuide(f"quality-{mood}")
-            notes = expand(guide.plan(mood, melody.FRAME_RATE * 60))
-            sounding = [note for note in notes if note is not None]
-            pitches = sorted(set(sounding))
+    def test_new_event_plan_preserves_exact_mrt_tokens(self):
+        guide = melody.MelodyGuide("exact-events")
+        events = expand(guide.plan_events("neutral", 80))
 
-            self.assertGreater(len(sounding), len(notes) * 0.25, mood)
-            self.assertLess(len(sounding), len(notes) * 0.80, mood)
-            self.assertGreaterEqual(len(pitches), 5, mood)
-            self.assertTrue(
-                all((note - guide.tonic) in scale for note in pitches),
-                (mood, pitches, guide.tonic),
-            )
-            transitions = [
-                (a, b)
-                for a, b in zip(notes, notes[1:])
-                if a is not None and b is not None and a != b
-            ]
-            self.assertTrue(
-                all(abs(a - b) <= 12 for a, b in transitions), transitions
-            )
-            for phrase_index in range(4):
-                phrase = guide._phrase(mood, phrase_index)
-                self.assertEqual(phrase[-2:], (0, None), (mood, phrase_index))
+        self.assertEqual(len(events), 80)
+        self.assertTrue(any(2 in event.tokens for event in events))
+        self.assertTrue(any(1 in event.tokens for event in events))
+        self.assertTrue(any(0 in event.tokens for event in events))
+        self.assertTrue(all(3 not in event.tokens for event in events))
 
-    def test_seed_is_repeatable_but_sessions_are_not_all_identical(self):
-        a = melody.MelodyGuide("listener-a")
-        again = melody.MelodyGuide("listener-a")
-        others = [melody.MelodyGuide(f"listener-{i}") for i in range(8)]
-
-        self.assertEqual(a.seed, again.seed)
-        self.assertEqual(a.tonic, again.tonic)
-        self.assertGreater(len({guide.tonic for guide in others}), 1)
-
-    def test_piano_roll_masks_accompaniment_and_marks_one_guide_note(self):
+    def test_integer_piano_roll_keeps_legacy_autostrum_behavior(self):
         self.assertIsNone(melody.piano_roll(None))
         tokens = melody.piano_roll(64)
 
@@ -72,18 +49,69 @@ class MelodyGuideTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             melody.piano_roll(128)
 
-    def test_mood_change_waits_for_a_step_boundary(self):
-        guide = melody.MelodyGuide("mood-change")
-        guide.plan("somber", 3)
-        old_mood = guide._active_mood
-        guide.plan("lively", 1)
-        self.assertEqual(guide._active_mood, old_mood)
+    def test_event_and_raw_roll_adapters_validate_without_losing_states(self):
+        tokens = [-1] * 128
+        tokens[60] = 0
+        tokens[62] = 1
+        tokens[64] = 2
+        event = PianoRollEvent(tuple(tokens), drum=1)
 
-        for _ in range(20):
-            guide.plan("lively", 1)
-            if guide._active_mood == "lively":
-                break
-        self.assertEqual(guide._active_mood, "lively")
+        self.assertEqual(melody.piano_roll(event), tokens)
+        self.assertEqual(melody.piano_roll(tuple(tokens)), tokens)
+        self.assertEqual(melody.drum_intent(event), 1)
+        self.assertEqual(melody.drum_intent(0), 0)
+        with self.assertRaises(ValueError):
+            melody.piano_roll(tokens[:-1])
+        with self.assertRaises(ValueError):
+            melody.piano_roll([4] * 128)
+        with self.assertRaises(ValueError):
+            melody.drum_intent(2)
+
+    def test_runtime_configuration_does_not_reset_the_legacy_clock(self):
+        guide = melody.MelodyGuide("runtime-controls")
+        guide.plan("neutral", 31)
+        before = guide.frame_index
+        guide.configure(
+            station="rainy cafe",
+            bpm=86,
+            groove=0.8,
+            intensity=0.7,
+            melody_enabled=True,
+            drums_enabled=False,
+        )
+        guide.plan("neutral", 17)
+
+        self.assertEqual(before, 31)
+        self.assertEqual(guide.frame_index, 48)
+        self.assertEqual(guide.composition.settings.station, "rainy cafe")
+        self.assertEqual(guide.composition.settings.bpm, 86)
+
+    def test_wire_toggle_names_are_accepted_by_the_facade(self):
+        guide = melody.MelodyGuide("wire-controls")
+        settings = guide.configure(
+            station="quiet-library",
+            mood="somber",
+            instrument="rhodes",
+            bpm=72,
+            groove=0.7,
+            intensity=0.3,
+            melody=False,
+            drums=False,
+        )
+
+        self.assertFalse(settings.melody_enabled)
+        self.assertFalse(settings.drums_enabled)
+        self.assertEqual(settings.station, "quiet-library")
+        self.assertEqual(settings.mood, "somber")
+
+    def test_session_seed_and_key_are_repeatable_but_not_globally_fixed(self):
+        first = melody.MelodyGuide("listener-a")
+        again = melody.MelodyGuide("listener-a")
+        others = [melody.MelodyGuide(f"listener-{index}") for index in range(12)]
+
+        self.assertEqual(first.seed, again.seed)
+        self.assertEqual(first.tonic, again.tonic)
+        self.assertGreater(len({guide.tonic for guide in others}), 1)
 
 
 if __name__ == "__main__":

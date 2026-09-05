@@ -2,9 +2,8 @@ import "./globals.css"
 import localFont from "next/font/local"
 import type React from "react"
 
-// the interface is one continuous dot matrix display, so the type is too.
-// this face is a real 5x7 matrix - round dots, no strokes - which is why
-// everything is set with wide tracking: the glyphs need air to resolve.
+// The matrix face is intentionally limited to small moments of identity. The
+// rest of the interface uses the system sans stack declared in globals.css.
 const dotMatrix = localFont({
   src: "./fonts/dotmatrix.woff2",
   variable: "--font-dot",
@@ -17,8 +16,7 @@ export const metadata = {
   description: "Endless lofi, generated live, steered while it plays",
 }
 
-// pick the theme before first paint - a panel that flashes white and then
-// goes black is the one thing that breaks the illusion of hardware
+// Pick the theme before first paint so the ambient field and surfaces agree.
 const NO_FLASH = `
 try {
   var s = localStorage.getItem("darkMode");

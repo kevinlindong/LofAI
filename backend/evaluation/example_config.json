@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "duration_seconds": 12.0,
+  "warmup_seconds": 0.0,
+  "engine": {
+    "model_size": "mrt2_small",
+    "backend": "python",
+    "bits": 8,
+    "fast_sampler": true,
+    "audio_style_blend": 0.75
+  },
+  "seeds": [20260903, 20260904, 20260905],
+  "styles": [
+    {
+      "id": "dusty-beats",
+      "station": "dusty-beats"
+    },
+    {
+      "id": "rainy-piano",
+      "station": "rainy-piano"
+    },
+    {
+      "id": "jazz-cafe",
+      "station": "jazz-cafe"
+    },
+    {
+      "id": "sunlit-groove",
+      "station": "sunlit-groove"
+    }
+  ],
+  "presets": [
+    {
+      "id": "project-legacy",
+      "temperature": 1.0,
+      "top_k": 100,
+      "cfg_musiccoca": 3.0,
+      "cfg_notes": 5.0,
+      "cfg_drums": 1.0,
+      "style_token_levels": 6,
+      "sampling_mode": "raw"
+    },
+    {
+      "id": "production",
+      "temperature": 1.1,
+      "top_k": 50,
+      "cfg_musiccoca": 1.6,
+      "cfg_notes": 2.4,
+      "cfg_drums": 4.0,
+      "style_token_levels": 6,
+      "sampling_mode": "production"
+    }
+  ],
+  "note_modes": [
+    {"id": "unconditioned", "kind": "masked"},
+    {"id": "lofai-guide", "kind": "app_melody"}
+  ],
+  "drum_modes": ["planned"],
+  "codebook_depths": [12, 10],
+  "report": {
+    "seed": 314159,
+    "max_pairs": 80
+  }
+}

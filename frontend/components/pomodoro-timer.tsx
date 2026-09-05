@@ -1,14 +1,12 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react"
 import { DotGlyph } from "@/components/dot-glyph"
 import { DotSlider } from "@/components/dot-slider"
 
 interface PomodoroTimerProps {
   onRunningChange: (running: boolean) => void
 }
-
-const SEGMENTS = 28
 
 const formatTime = (seconds: number) => {
   const total = Math.max(0, Math.ceil(seconds))
@@ -88,7 +86,7 @@ export function PomodoroTimer({ onRunningChange }: PomodoroTimerProps) {
   }
 
   const elapsed = total > 0 ? 1 - timeLeft / total : 0
-  const lit = Math.round(Math.min(1, Math.max(0, elapsed)) * SEGMENTS)
+  const progress = `${Math.min(1, Math.max(0, elapsed)) * 100}%`
 
   return (
     <div className="flex flex-col gap-4">
@@ -124,18 +122,16 @@ export function PomodoroTimer({ onRunningChange }: PomodoroTimerProps) {
         </div>
       </div>
 
-      <div className="flex items-center justify-between" aria-hidden>
-        {Array.from({ length: SEGMENTS }, (_, i) => (
-          <span
-            key={i}
-            className="rounded-full"
-            style={{
-              width: 4,
-              height: 4,
-              background: i < lit ? "var(--accent)" : "var(--dot-1)",
-            }}
-          />
-        ))}
+      <div
+        className="flow-meter"
+        style={{ "--progress": progress } as CSSProperties}
+        role="progressbar"
+        aria-label={`${isBreak ? "Break" : "Focus"} progress`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(elapsed * 100)}
+      >
+        <span />
       </div>
 
       <div className="grid grid-cols-2 gap-x-5 gap-y-3">

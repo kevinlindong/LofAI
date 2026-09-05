@@ -8,7 +8,9 @@ from pathlib import Path
 import tempfile
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -20,6 +22,29 @@ log = logging.getLogger(__name__)
 
 class EngineStopping(RuntimeError):
     """Raised on the model thread when application shutdown is requested."""
+
+
+@dataclass(frozen=True)
+class SamplingControls:
+    """Per-run sampler controls, so listeners can steer without reloading."""
+
+    temperature: float
+    top_k: int
+    cfg_musiccoca: float
+    cfg_notes: float
+    cfg_drums: float
+
+
+@dataclass(frozen=True)
+class ConditioningRun:
+    """One run of frames that share style, notes, drums, and sampler values."""
+
+    style: np.ndarray
+    key: str | None
+    notes: Any
+    frames: int
+    drum: int | None = None
+    sampling: SamplingControls | None = None
 
 # mrt2 emits 40ms frames of 48khz stereo audio
 FRAMES_PER_SECOND = 25
@@ -112,14 +137,13 @@ class MRTEngine:
         # was worth, the eager path pipelines now and has closed some of it.
         self.backend = os.environ.get("MRT_BACKEND", "python")
         self.bits = _env_int("MRT_BITS", 8)
-        # Match the stable sampling centre of Magenta's listener-facing MRT2
-        # runtime. The melody guide below supplies structure, so randomness can
-        # stay in the performance instead of deciding whether a tune exists.
-        self.temperature = _env_float("MRT_TEMPERATURE", 1.0)
-        self.top_k = _env_int("MRT_TOP_K", 100)
-        self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 3.0)
-        self.cfg_notes = _env_float("MRT_CFG_NOTES", 5.0)
-        self.cfg_drums = _env_float("MRT_CFG_DRUMS", 1.0)
+        # Start at Magenta's listener UI centre. These are still exposed as
+        # controls and evaluated perceptually; they are not universal optima.
+        self.temperature = _env_float("MRT_TEMPERATURE", 1.1)
+        self.top_k = _env_int("MRT_TOP_K", 50)
+        self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 1.6)
+        self.cfg_notes = _env_float("MRT_CFG_NOTES", 2.4)
+        self.cfg_drums = _env_float("MRT_CFG_DRUMS", 4.0)
 
         # The official live engine keeps the coarse half of MusicCoCa's RVQ
         # tokens and masks its fine tail. Broad musical style survives while
@@ -141,7 +165,9 @@ class MRTEngine:
         self.mlx_cache_mb = _env_int("MRT_MLX_CACHE_MB", 384)
         self.fast_sampler_enabled = _env_int("MRT_FAST_SAMPLER", 1) != 0
 
-        # 0 keeps the auto-tuner; any other value pins the codebook count
+        # 0 keeps the live auto-tuner; any other value pins the codebook count.
+        # Evaluation and offline renders explicitly pin all 12, while the live
+        # path refuses to pretend a permanently sub-real-time stream is viable.
         self.pinned_codebooks = _env_int("MRT_CODEBOOKS", 0)
         self.min_codebooks = max(
             ABSOLUTE_MIN_CODEBOOKS,
@@ -154,8 +180,16 @@ class MRTEngine:
         self._warm = False
         self._style_key = None
         self._notes_key = None
-        self._embeddings: dict[str, np.ndarray] = {}
-        self._blocks: dict[tuple[str, int | None], tuple] = {}
+        self._drums_key = None
+        self._embeddings: dict[tuple[str, str | None], np.ndarray] = {}
+        self._style_tokens: dict[tuple[str, int], tuple[int, ...]] = {}
+        self._blocks: OrderedDict[tuple, tuple] = OrderedDict()
+        self.conditioning_cache_size = max(
+            64, _env_int("MRT_CONDITIONING_CACHE_SIZE", 2048)
+        )
+        self.audio_style_blend = max(
+            0.0, min(1.0, _env_float("MRT_AUDIO_STYLE_BLEND", 0.75))
+        )
         self._load_lock = threading.Lock()
         self._stop_requested = threading.Event()
         self.load_error: str | None = None
@@ -170,6 +204,7 @@ class MRTEngine:
         # recent render cost in seconds per frame, for the auto-tuner
         self._costs: deque[float] = deque(maxlen=COST_WINDOW)
         self._cost_lock = threading.Lock()
+        self._active_streams = 1
         self._last_tune = 0.0
         cache_root = os.environ.get(
             "MRT_EMBEDDING_CACHE",
@@ -190,6 +225,18 @@ class MRTEngine:
         if cost <= 0.0:
             return 0.0
         return FRAME_SECONDS / cost
+
+    def effective_realtime_factor(self) -> float:
+        """Measured render headroom available to each concurrent listener."""
+        factor = self.realtime_factor()
+        with self._cost_lock:
+            active_streams = self._active_streams
+        return factor / max(1, active_streams)
+
+    def throughput_ready(self) -> bool:
+        """Whether enough same-quality renders exist for admission decisions."""
+        with self._cost_lock:
+            return len(self._costs) >= MIN_TUNE_SAMPLES
 
     def _typical_cost(self) -> float:
         with self._cost_lock:
@@ -229,28 +276,25 @@ class MRTEngine:
             if self._system is not None:
                 return
 
-            from magenta_rt.config import MUSICCOCA, PIANOROLL_WITH_ONSETS
+            from magenta_rt.config import (
+                DRUM_PIANOROLL,
+                MUSICCOCA,
+                PIANOROLL_WITH_ONSETS,
+            )
 
             self._style_key = MUSICCOCA.key
             self._notes_key = PIANOROLL_WITH_ONSETS.key
+            self._drums_key = DRUM_PIANOROLL.key
             started = time.monotonic()
 
             if self.backend == "mlxfn":
                 log.warning(
-                    "MRT_BACKEND=mlxfn: exported graphs decode to noise under "
-                    "mlx %s. only set this once mlx can export this model again.",
+                    "MRT_BACKEND=mlxfn requested, but exported graphs decode to "
+                    "noise under mlx %s and cannot honor per-take decoder seeds; "
+                    "using the eager python model instead",
                     _mlx_version(),
                 )
-                try:
-                    self._system = self._load_mlxfn()
-                except Exception as exc:  # noqa: BLE001
-                    # the published .mlxfn needs a newer mlx than pip ships
-                    log.warning(
-                        "could not load the exported graph (%s), using the "
-                        "python model instead",
-                        exc,
-                    )
-                    self.backend = "python"
+                self.backend = "python"
 
             if self._system is None:
                 self._system = self._load_python()
@@ -283,10 +327,14 @@ class MRTEngine:
         # model built and quantized at load time from the safetensors checkpoint
         from magenta_rt.mlx.system import MagentaRT2System
 
-        log.info("loading %s (python backend, %d-bit)", self.size, self.bits)
+        if self.bits not in (0, 4, 8):
+            raise ValueError("MRT_BITS must be 0 (full precision), 4, or 8")
+
+        precision = "full precision" if self.bits == 0 else f"{self.bits}-bit"
+        log.info("loading %s (python backend, %s)", self.size, precision)
         return MagentaRT2System(
             size=self.size,
-            bits=self.bits,
+            bits=self.bits or None,
             temperature=self.temperature,
             top_k=self.top_k,
             cfg_scales={
@@ -347,9 +395,16 @@ class MRTEngine:
 
     # --- style ---
 
-    def embed(self, prompt: str) -> np.ndarray:
-        # style embedding for a prompt, cached (text encoding is a tflite call)
-        cached = self._embeddings.get(prompt)
+    def embed(self, prompt: str, reference: str | None = None) -> np.ndarray:
+        """Embed a short style label, optionally anchored by a local WAV.
+
+        Text is always mapped into MusicCoCa's audio space.  A reference uses
+        the native audio encoder and is linearly blended with the text target;
+        this keeps the station named while grounding its actual timbre.
+        """
+        reference_key = str(Path(reference).expanduser().resolve()) if reference else None
+        cache_key = (prompt, reference_key)
+        cached = self._embeddings.get(cache_key)
         if cached is not None:
             return cached
 
@@ -358,13 +413,33 @@ class MRTEngine:
         # native runtime; without it most prompt tokens differ and conditioning
         # is markedly less faithful. Embeddings are warmed once, so it adds no
         # cost to live generation.
-        embedding = np.asarray(
+        text_embedding = np.asarray(
             self._system.embed_style(prompt, use_mapper=True), dtype=np.float32
         )
-        self._embeddings[prompt] = embedding
+        embedding = text_embedding
+        if reference_key is not None:
+            from magenta_rt.audio import Waveform
+
+            waveform = Waveform.from_file(reference_key)
+            audio_embedding = np.asarray(
+                self._system.embed_style(waveform), dtype=np.float32
+            )
+            weight = self.audio_style_blend
+            embedding = ((1.0 - weight) * text_embedding + weight * audio_embedding).astype(
+                np.float32
+            )
+            log.info(
+                "anchored style %r to %s at %.0f%%",
+                prompt,
+                reference_key,
+                weight * 100.0,
+            )
+        self._embeddings[cache_key] = embedding
         return embedding
 
-    def warm_embeddings(self, prompts: list[str]):
+    def warm_embeddings(
+        self, prompts: list[str], references: dict[str, str] | None = None
+    ):
         # pre-embed every prompt so style changes never wait on the text encoder
         self._load_embedding_cache(prompts)
         for prompt in prompts:
@@ -372,12 +447,23 @@ class MRTEngine:
             self.embed(prompt)
         self._save_embedding_cache(prompts)
 
+        references = references or {}
+        for prompt, reference in references.items():
+            self._raise_if_stopping()
+            self.embed(prompt, reference)
+
         # MusicCoCa builds its RVQ interpreter lazily. Build and cache every
         # fixed conditioning block now so no listener pays that startup cost.
-        if prompts:
+        if prompts and self._fast:
             for prompt in prompts:
                 self._raise_if_stopping()
-                self._conditioning(self._embeddings[prompt], prompt)
+                reference = references.get(prompt)
+                key = self.style_cache_key(prompt, reference)
+                self._conditioning(self.embed(prompt, reference), key)
+
+    @staticmethod
+    def style_cache_key(prompt: str, reference: str | None = None) -> str:
+        return prompt if reference is None else f"{prompt}\0audio:{reference}"
 
     def _embedding_cache_path(self, prompts: list[str]) -> Path | None:
         if self._embedding_cache_dir is None:
@@ -410,20 +496,27 @@ class MRTEngine:
                 return
             if embeddings.dtype != np.float32 or not np.isfinite(embeddings).all():
                 return
-            self._embeddings.update(zip(prompts, embeddings, strict=True))
+            self._embeddings.update(
+                ((prompt, None), embedding)
+                for prompt, embedding in zip(prompts, embeddings, strict=True)
+            )
             log.info("loaded %d mapped style embeddings from cache", len(prompts))
         except (OSError, ValueError, KeyError):
             log.warning("ignoring invalid style embedding cache %s", path)
 
     def _save_embedding_cache(self, prompts: list[str]):
         path = self._embedding_cache_path(prompts)
-        if path is None or not prompts or not all(p in self._embeddings for p in prompts):
+        if path is None or not prompts or not all(
+            (prompt, None) in self._embeddings for prompt in prompts
+        ):
             return
         if path.is_file():
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            embeddings = np.stack([self._embeddings[p] for p in prompts]).astype(np.float32)
+            embeddings = np.stack(
+                [self._embeddings[(prompt, None)] for prompt in prompts]
+            ).astype(np.float32)
             with tempfile.NamedTemporaryFile(
                 mode="wb", suffix=".npz", dir=path.parent, delete=False
             ) as temp:
@@ -434,31 +527,91 @@ class MRTEngine:
         except OSError as exc:
             log.warning("could not cache style embeddings: %s", exc)
 
+    def default_sampling(self) -> SamplingControls:
+        return SamplingControls(
+            temperature=self.temperature,
+            top_k=self.top_k,
+            cfg_musiccoca=self.cfg_musiccoca,
+            cfg_notes=self.cfg_notes,
+            cfg_drums=self.cfg_drums,
+        )
+
+    @staticmethod
+    def _note_tokens(notes: Any) -> list[int] | None:
+        if notes is None or isinstance(notes, (int, np.integer)):
+            return piano_roll(None if notes is None else int(notes))
+        raw = getattr(notes, "tokens", notes)
+        tokens = [int(token) for token in raw]
+        if len(tokens) != 128:
+            raise ValueError(f"expected 128 piano-roll tokens, got {len(tokens)}")
+        if any(token not in (-1, 0, 1, 2, 3) for token in tokens):
+            raise ValueError("invalid piano-roll token")
+        return tokens
+
     def _conditioning(
-        self, style: np.ndarray, key: str | None, note: int | None = None
+        self,
+        style: np.ndarray,
+        key: str | None,
+        notes: Any = None,
+        drum: int | None = None,
+        sampling: SamplingControls | None = None,
     ):
-        # Tokenize style plus the current melodic guide note into the block the
-        # sampler conditions on. `key` caches fixed prompt/note combinations;
-        # blended embeddings during a slider ramp are each seen only once.
-        cache_key = (key, note) if key is not None else None
+        # Tokenize the frame controls into the block consumed by the sampler.
+        # Blended embeddings have no stable key and intentionally bypass this
+        # cache; fixed station/note/control combinations are reused.
+        sampling = sampling or self.default_sampling()
+        note_tokens = self._note_tokens(notes)
+        if drum is None and hasattr(notes, "drum"):
+            drum = int(notes.drum)
+        if drum is not None and drum not in (-1, 0, 1):
+            raise ValueError(f"invalid drum token: {drum}")
+        cache_key = (
+            key,
+            tuple(note_tokens) if note_tokens is not None else None,
+            drum,
+            sampling,
+        ) if key is not None else None
         if key is not None:
             cached = self._blocks.get(cache_key)
             if cached is not None:
+                self._blocks.move_to_end(cache_key)
                 return cached
 
-        tokens = list(self._system._style_model.tokenize(style))
-        tokens[self.style_token_levels :] = [-1] * (
-            len(tokens) - self.style_token_levels
+        style_token_key = (key, self.style_token_levels) if key is not None else None
+        fixed_tokens = (
+            self._style_tokens.get(style_token_key)
+            if style_token_key is not None
+            else None
         )
+        if fixed_tokens is None:
+            tokens = list(self._system._style_model.tokenize(style))
+            tokens[self.style_token_levels :] = [-1] * (
+                len(tokens) - self.style_token_levels
+            )
+            if style_token_key is not None:
+                fixed_tokens = tuple(int(token) for token in tokens)
+                self._style_tokens[style_token_key] = fixed_tokens
+        tokens = list(fixed_tokens) if fixed_tokens is not None else tokens
         conditioning = {self._style_key: tokens}
-        notes = piano_roll(note)
-        if notes is not None:
-            conditioning[self._notes_key] = notes
+        if note_tokens is not None:
+            conditioning[self._notes_key] = note_tokens
+        if drum is not None:
+            conditioning[self._drums_key] = [drum]
         built = self._system._build_conditioning(
-            conditioning, None, None, None
+            conditioning,
+            {
+                "musiccoca": sampling.cfg_musiccoca,
+                "notes": sampling.cfg_notes,
+                "drums": sampling.cfg_drums,
+            },
+            sampling.temperature,
+            sampling.top_k,
         )
         if cache_key is not None:
             self._blocks[cache_key] = built
+            self._blocks.move_to_end(cache_key)
+            while len(self._blocks) > self.conditioning_cache_size:
+                self._blocks.popitem(last=False)
         return built
 
     # --- quality dial ---
@@ -517,8 +670,9 @@ class MRTEngine:
         # Every backend must prove that it decodes plausible audio before ready
         # becomes true. This catches silence, clipping, and the known mlxfn
         # white-noise failure before a listener can ever receive its PCM.
-        prompt, style = next(iter(self._embeddings.items()))
-        plan = ((style, prompt, None, PROBE_FRAMES),)
+        (prompt, reference), style = next(iter(self._embeddings.items()))
+        key = self.style_cache_key(prompt, reference)
+        plan = (ConditioningRun(style, key, None, PROBE_FRAMES),)
         quality_pcm = []
         pcm, probe_state = self.generate(None, plan)
         quality_pcm.append(pcm)
@@ -600,13 +754,14 @@ class MRTEngine:
             report.high_band_fraction * 100.0,
         )
 
-    def note_render(self, frames: int, seconds: float):
+    def note_render(self, frames: int, seconds: float, active_streams: int = 1):
         # feed the tuner. see COST_WINDOW for why this is a median and not an
         # average: we do not want the quality flapping every time something
         # else on the machine has a moment.
         if frames <= 0 or seconds <= 0.0:
             return
         with self._cost_lock:
+            self._active_streams = max(1, int(active_streams))
             self._costs.append(seconds / frames)
         self._retune(time.monotonic())
 
@@ -639,7 +794,7 @@ class MRTEngine:
         # also report low water; lowering model quality cannot fix those. Do
         # not spend fidelity while measured rendering still clears its target.
         # Audible gaps remain the unconditional signal in note_gap().
-        factor = self.realtime_factor()
+        factor = self.effective_realtime_factor()
         if sample_count < MIN_TUNE_SAMPLES or factor >= self.target_rtf:
             return
         if self.set_codebooks(self.codebooks - 1):
@@ -661,7 +816,7 @@ class MRTEngine:
         if sample_count < MIN_TUNE_SAMPLES:
             return
 
-        factor = self.realtime_factor()
+        factor = self.effective_realtime_factor()
         if factor < self.target_rtf and self.codebooks > self.min_codebooks:
             changed = self.set_codebooks(self.codebooks - 1)
         elif factor > self.target_rtf * 1.3 and self.codebooks < self.max_codebooks:
@@ -684,15 +839,40 @@ class MRTEngine:
 
     # --- generation ---
 
+    def _run_parts(self, run) -> tuple:
+        if isinstance(run, ConditioningRun):
+            return (
+                run.style,
+                run.key,
+                run.notes,
+                run.frames,
+                run.drum,
+                run.sampling or self.default_sampling(),
+            )
+        if len(run) == 4:
+            style, key, notes, frames = run
+            return style, key, notes, frames, None, self.default_sampling()
+        if len(run) == 5:
+            style, key, notes, frames, drum = run
+            return style, key, notes, frames, drum, self.default_sampling()
+        if len(run) == 6:
+            style, key, notes, frames, drum, sampling = run
+            if sampling is None:
+                sampling = self.default_sampling()
+            elif not isinstance(sampling, SamplingControls):
+                sampling = SamplingControls(*sampling)
+            return style, key, notes, frames, drum, sampling
+        raise ValueError("conditioning run must have 4, 5, or 6 values")
+
     def generate(self, state, plan, seed: int | None = None):
         # render one chunk, returning interleaved int16 pcm and the next state
         #
-        # `plan` is a sequence of (style, cache key, guide note, frames)
-        # segments. Style ramps and melodic note boundaries split it only where
-        # conditioning actually changes.
+        # A plan contains ConditioningRun values (legacy four-tuples are still
+        # accepted). Style, score, drum, and control boundaries split it only
+        # where conditioning actually changes.
         self._raise_if_stopping()
         if not self._fast:
-            return self._generate_stock(state, plan)
+            return self._generate_stock(state, plan, seed=seed)
 
         mx = self._mx
         sampler = self._sampler
@@ -720,9 +900,12 @@ class MRTEngine:
         # bit for bit the same audio as blocking on every frame.
         pending = None
 
-        for style, key, note, frames in plan:
+        for run in plan:
             self._raise_if_stopping()
-            block, constants = self._conditioning(style, key, note)
+            style, key, notes, frames, drum, sampling = self._run_parts(run)
+            block, constants = self._conditioning(
+                style, key, notes, drum=drum, sampling=sampling
+            )
             for _ in range(frames):
                 if self._stop_requested.is_set():
                     # Do not leave an already-submitted GPU operation running
@@ -753,22 +936,73 @@ class MRTEngine:
         samples = np.asarray(self._sl.Sequence.concatenate_sequences(outputs).values[0])
         return np.ascontiguousarray(samples, dtype=np.int16).tobytes(), state
 
-    def _generate_stock(self, state, plan):
+    def _new_eager_state(self, seed: int | None):
+        """Create the pinned eager sampler state with an optional decoder seed."""
+        mx = getattr(self, "_mx", None)
+        sl = getattr(self, "_sl", None)
+        if mx is None:
+            import mlx.core as mx
+        if sl is None:
+            import sequence_layers.mlx as sl
+
+        input_spec = sl.ChannelSpec(
+            shape=(self._system._num_channels,), dtype=mx.int32
+        )
+        state = self._system._sampler.get_initial_state(
+            1, input_spec, constants={}, training=False
+        )
+        if seed is None:
+            return state
+
+        streaming_state = state[0]
+        _rng, previous, temporal, step = streaming_state[2]
+        seeded_decoder = (
+            mx.stack([mx.random.key(int(seed) & 0xFFFFFFFF)]),
+            previous,
+            temporal,
+            step,
+        )
+        seeded_streaming = (
+            streaming_state[0],
+            streaming_state[1],
+            seeded_decoder,
+            streaming_state[3],
+        )
+        return (seeded_streaming, *state[1:])
+
+    def _generate_stock(self, state, plan, seed: int | None = None):
         # the library's own call, one segment at a time. only used when the
         # fast path could not find what it needs.
+        if state is None and seed is not None:
+            # Magenta's stock wrapper otherwise initializes every take with
+            # decoder key 42. Seed its eager state explicitly so "new take"
+            # and fixed-seed comparisons keep the same semantics as fast mode.
+            state = self._new_eager_state(seed)
         chunks = []
-        for style, _key, note, frames in plan:
+        for run in plan:
             self._raise_if_stopping()
+            style, _key, notes, frames, drum, sampling = self._run_parts(run)
             style_tokens = list(self._system._style_model.tokenize(style))
             style_tokens[self.style_token_levels :] = [-1] * (
                 len(style_tokens) - self.style_token_levels
             )
             conditioning = {self._style_key: style_tokens}
-            notes = piano_roll(note)
-            if notes is not None:
-                conditioning[self._notes_key] = notes
+            note_tokens = self._note_tokens(notes)
+            if note_tokens is not None:
+                conditioning[self._notes_key] = note_tokens
+            if drum is None and hasattr(notes, "drum"):
+                drum = int(notes.drum)
+            if drum is not None:
+                conditioning[self._drums_key] = [drum]
             waveform, state = self._system.generate(
                 conditioning=conditioning,
+                cfg_scales={
+                    "musiccoca": sampling.cfg_musiccoca,
+                    "notes": sampling.cfg_notes,
+                    "drums": sampling.cfg_drums,
+                },
+                temperature=sampling.temperature,
+                top_k=sampling.top_k,
                 frames=frames,
                 state=state,
             )
@@ -783,7 +1017,9 @@ class MRTEngine:
         self._warm = False
         self._style_key = None
         self._notes_key = None
+        self._drums_key = None
         self._embeddings.clear()
+        self._style_tokens.clear()
         self._blocks.clear()
         self._sampler = None
         self._input_spec = None
@@ -791,6 +1027,7 @@ class MRTEngine:
         self._system = None
         self._fast = False
         self._fast_sampling = False
+        self._active_streams = 1
         self._clear_costs()
 
         mx = getattr(self, "_mx", None)
