@@ -159,6 +159,74 @@ add_target() {
     TARGET_RECORDS+=("$record")
 }
 
+add_discovered_pid() {
+    local pid="$1"
+    local name="$2"
+    local started
+    local existing
+
+    if [ "${#TARGET_PIDS[@]}" -gt 0 ]; then
+        for existing in "${TARGET_PIDS[@]}"; do
+            [ "$existing" = "$pid" ] && return 0
+        done
+    fi
+    started="$(process_started_at "$pid")"
+    [ -n "$started" ] || return 0
+
+    TARGET_MODES+=("pid")
+    TARGET_PIDS+=("$pid")
+    TARGET_FILES+=("")
+    TARGET_NAMES+=("$name")
+    TARGET_STARTED+=("$started")
+    TARGET_RECORDS+=("")
+}
+
+discover_project_processes() {
+    local directory="$1"
+    local kind="$2"
+    local pid
+    local comm
+    local command
+    local matched
+
+    command -v lsof >/dev/null 2>&1 || return 0
+    [ -d "$directory" ] || return 0
+
+    # PID files are the authority for normal shutdown. This recovery pass is
+    # deliberately narrow: it only adopts known lofAI server/worker commands
+    # whose current working directory is this checkout. It catches framework
+    # workers orphaned by an older launcher or an interrupted Next.js build
+    # without falling back to a machine-wide pkill pattern.
+    while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [ "$pid" -gt 1 ] || continue
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//')"
+        command="$(ps -o command= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//')"
+        matched=0
+
+        if [ "$kind" = "frontend" ]; then
+            case "$comm" in
+                next-*|next-server) matched=1 ;;
+            esac
+            case "$command" in
+                *"/node_modules/.bin/next "*|*"/next/dist/compiled/jest-worker/processChild.js"*|*"npm run dev"*|*"npm run start"*|*"npm run build"*)
+                    matched=1
+                    ;;
+            esac
+        else
+            case "$command" in
+                *"uvicorn server:app"*|*"/backend/server.py"*|*"python server.py"*)
+                    matched=1
+                    ;;
+            esac
+        fi
+
+        if [ "$matched" -eq 1 ]; then
+            add_discovered_pid "$pid" "untracked $kind worker"
+        fi
+    done < <(lsof -nP -t -a -d cwd +d "$directory" 2>/dev/null | sort -u)
+}
+
 if [ "$CHILDREN_ONLY" -eq 0 ]; then
     add_target "$STATE_DIR/.lofai.lock" "application supervisor"
     # Read the pre-lock filename during migration from older launchers.
@@ -167,6 +235,14 @@ if [ "$CHILDREN_ONLY" -eq 0 ]; then
 fi
 add_target "$STATE_DIR/frontend.pid" "frontend"
 add_target "$STATE_DIR/backend.pid" "backend"
+
+# Custom state directories are used by the process-level test harness and may
+# represent another checkout. Only sweep this checkout by default when it is
+# also the requested state owner; callers can explicitly opt in if needed.
+if [ "$STATE_DIR" = "$SCRIPT_DIR" ] || [ "${LOFAI_RECOVER_ORPHANS:-0}" = "1" ]; then
+    discover_project_processes "$SCRIPT_DIR/frontend" "frontend"
+    discover_project_processes "$SCRIPT_DIR/backend" "backend"
+fi
 
 if [ "${#TARGET_PIDS[@]}" -eq 0 ]; then
     log "lofAI is already stopped."

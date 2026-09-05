@@ -165,7 +165,11 @@ cleanup() {
     local children_stopped=0
     local pid
 
-    trap - EXIT INT TERM HUP
+    trap - EXIT
+    # Cleanup is bounded and must be allowed to finish. A second Ctrl+C while
+    # the model is releasing memory must not kill the supervisor and orphan
+    # the service groups it is in the middle of stopping.
+    trap '' INT TERM HUP
 
     if [ -n "$STARTUP_WAIT_PID" ]; then
         kill -TERM "$STARTUP_WAIT_PID" 2>/dev/null || true

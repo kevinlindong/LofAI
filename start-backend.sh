@@ -7,6 +7,9 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+source "$SCRIPT_DIR/service-lifecycle.sh"
+lofai_service_lifecycle_init
+
 MODEL_SIZE="${MRT_MODEL_SIZE:-mrt2_small}"
 MAGENTA_ROOT="${MAGENTA_HOME:-$HOME/Documents/Magenta}/magenta-rt-v2"
 BACKEND_HOST="${LOFAI_BACKEND_HOST:-127.0.0.1}"
@@ -23,14 +26,14 @@ fi
 if [ ! -d "venv" ]; then
     echo "Creating Python virtual environment..."
     PYTHON_BIN="$(command -v python3.12 || command -v python3.11 || command -v python3)"
-    "$PYTHON_BIN" -m venv venv
+    lofai_run_service_command "$PYTHON_BIN" -m venv venv
 fi
 
 source venv/bin/activate
 
 # Install/update backend dependencies
 echo "Installing backend dependencies..."
-pip install -q -r backend/requirements.txt
+lofai_run_service_command pip install -q -r backend/requirements.txt
 
 # Fetch the model assets (a few GB, first run only). Check the files actually
 # consumed by mapped MusicCoCa and SpectroStream; an interrupted/older download
@@ -54,12 +57,12 @@ done
 
 if [ "$RESOURCES_COMPLETE" = "0" ]; then
     echo "Downloading shared resources (MusicCoCa + SpectroStream)..."
-    mrt models init --source hf
+    lofai_run_service_command mrt models init --source hf
 fi
 
 if [ ! -f "$MAGENTA_ROOT/checkpoints/$MODEL_SIZE.safetensors" ]; then
     echo "Downloading $MODEL_SIZE checkpoint..."
-    mrt checkpoints download "$MODEL_SIZE" --source hf
+    lofai_run_service_command mrt checkpoints download "$MODEL_SIZE" --source hf
 fi
 
 # No .mlxfn export here on purpose. The exported-graph path is ~40% faster, but
@@ -70,11 +73,14 @@ fi
 
 # The model takes a few seconds to load, so --reload is off by default; set
 # LOFAI_RELOAD=1 if you are editing the server and can wait for it each time.
-RELOAD_FLAG=""
-if [ "${LOFAI_RELOAD:-0}" = "1" ]; then
-    RELOAD_FLAG="--reload"
-fi
-
 echo "Starting backend server on http://$BACKEND_HOST:8000"
 cd backend
-exec python -m uvicorn server:app $RELOAD_FLAG --host "$BACKEND_HOST" --port 8000 --ws-per-message-deflate false
+if [ "${LOFAI_RELOAD:-0}" = "1" ]; then
+    lofai_run_service_command \
+        python -m uvicorn server:app --reload --host "$BACKEND_HOST" --port 8000 \
+        --ws-per-message-deflate false
+else
+    lofai_run_service_command \
+        python -m uvicorn server:app --host "$BACKEND_HOST" --port 8000 \
+        --ws-per-message-deflate false
+fi

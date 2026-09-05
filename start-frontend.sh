@@ -4,14 +4,18 @@
 
 set -e
 
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source "$SCRIPT_DIR/service-lifecycle.sh"
+lofai_service_lifecycle_init
+
 echo "Starting lofAI frontend..."
 
-cd frontend
+cd "$SCRIPT_DIR/frontend"
 
 # Check if node_modules exists
 if [ ! -d "node_modules" ]; then
     echo "Installing frontend dependencies..."
-    npm install
+    lofai_run_service_command npm install
 fi
 
 # The development router is intentionally opt-in. Long-running `next dev`
@@ -28,7 +32,8 @@ fi
 
 if [ "$FRONTEND_MODE" = "development" ] || [ "$FRONTEND_MODE" = "dev" ]; then
     echo "Starting development frontend on http://localhost:$FRONTEND_PORT"
-    PORT="$FRONTEND_PORT" exec npm run dev
+    PORT="$FRONTEND_PORT" lofai_run_service_command npm run dev
+    exit $?
 fi
 
 if [ "$FRONTEND_MODE" != "production" ]; then
@@ -50,8 +55,8 @@ fi
 
 if [ "$NEEDS_BUILD" = "1" ]; then
     echo "Building optimized frontend..."
-    npm run build
+    lofai_run_service_command npm run build
 fi
 
 echo "Starting production frontend on http://localhost:$FRONTEND_PORT"
-PORT="$FRONTEND_PORT" exec npm run start
+PORT="$FRONTEND_PORT" lofai_run_service_command npm run start

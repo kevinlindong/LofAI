@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 START = ROOT / "start.sh"
 STOP = ROOT / "stop.sh"
+SERVICE_LIFECYCLE = ROOT / "service-lifecycle.sh"
 
 
 def wait_for(predicate, timeout=8.0):
@@ -42,6 +44,16 @@ def process_is_live(pid):
     )
     state = result.stdout.strip()
     return bool(state) and not state.startswith("Z")
+
+
+def process_name(pid):
+    result = subprocess.run(
+        ["ps", "-o", "comm=", "-p", str(pid)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip()
 
 
 SERVICE_SOURCE = '''#!/usr/bin/env python3
@@ -96,6 +108,132 @@ class ApplicationShutdownTests(unittest.TestCase):
         path.write_text(SERVICE_SOURCE.replace("__FAKE_NAME__", name))
         path.chmod(0o755)
         return path
+
+    def make_managed_service(self, name):
+        service = self.make_service(name)
+        wrapper = self.state / f"{name}.sh"
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            "set -e\n"
+            f'source "{SERVICE_LIFECYCLE}"\n'
+            "lofai_service_lifecycle_init\n"
+            f'lofai_run_service_command "{service}"\n'
+        )
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def test_ctrl_c_stops_nested_service_groups(self):
+        backend = self.make_managed_service("backend")
+        frontend = self.make_managed_service("frontend")
+        env = os.environ.copy()
+        env.update(
+            LOFAI_STATE_DIR=str(self.state),
+            LOFAI_BACKEND_SCRIPT=str(backend),
+            LOFAI_FRONTEND_SCRIPT=str(frontend),
+            LOFAI_STARTUP_DELAY="0",
+            LOFAI_STOP_TIMEOUT="3",
+            LOFAI_KILL_TIMEOUT="1",
+            LOFAI_SERVICE_TERM_TIMEOUT="1",
+            LOFAI_SERVICE_KILL_TIMEOUT="1",
+            FAKE_STATE=str(self.state),
+            FAKE_IGNORE_TERM="frontend",
+        )
+        supervisor = subprocess.Popen(
+            [str(START)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        markers = [
+            self.state / f"{name}.{kind}"
+            for name in ("backend", "frontend")
+            for kind in ("parent", "child")
+        ]
+        self.assertTrue(wait_for(lambda: all(path.exists() for path in markers)))
+        service_pids = [int(path.read_text()) for path in markers]
+
+        # A terminal delivers Ctrl+C to the foreground process group. The two
+        # services are intentionally in separate nested groups, so only the
+        # supervisor receives SIGINT and must propagate shutdown itself.
+        os.killpg(supervisor.pid, signal.SIGINT)
+        time.sleep(0.05)
+        # Repeated Ctrl+C is common when native cleanup takes a moment. It must
+        # not interrupt the cleanup routine and strand the resistant worker.
+        os.killpg(supervisor.pid, signal.SIGINT)
+        output, _ = supervisor.communicate(timeout=8)
+
+        self.assertEqual(supervisor.returncode, 130, output)
+        self.assertTrue(
+            wait_for(lambda: not any(process_is_live(pid) for pid in service_pids)),
+            f"live nested descendants: "
+            f"{[pid for pid in service_pids if process_is_live(pid)]}",
+        )
+        for name in (".lofai.lock", "logs.pid", "frontend.pid", "backend.pid"):
+            self.assertFalse((self.state / name).exists(), name)
+
+    def test_standalone_service_ctrl_c_forces_resistant_descendants_down(self):
+        backend = self.make_managed_service("backend")
+        env = os.environ.copy()
+        env.update(
+            LOFAI_SERVICE_TERM_TIMEOUT="0",
+            LOFAI_SERVICE_KILL_TIMEOUT="1",
+            FAKE_STATE=str(self.state),
+            FAKE_IGNORE_TERM="backend",
+        )
+        launcher = subprocess.Popen(
+            [str(backend)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        markers = [self.state / "backend.parent", self.state / "backend.child"]
+        self.assertTrue(wait_for(lambda: all(path.exists() for path in markers)))
+        service_pids = [int(path.read_text()) for path in markers]
+
+        os.killpg(launcher.pid, signal.SIGINT)
+        output, _ = launcher.communicate(timeout=5)
+
+        self.assertEqual(launcher.returncode, 130, output)
+        self.assertIn("forcing them down", output)
+        self.assertTrue(
+            wait_for(lambda: not any(process_is_live(pid) for pid in service_pids))
+        )
+
+    @unittest.skipUnless(shutil.which("lsof") and shutil.which("node"), "needs lsof and node")
+    def test_stop_recovers_untracked_project_worker(self):
+        worker = subprocess.Popen(
+            [
+                "node",
+                "-e",
+                "process.title='next-router-worker'; setInterval(() => {}, 1000)",
+            ],
+            cwd=ROOT / "frontend",
+            start_new_session=True,
+        )
+        try:
+            self.assertTrue(
+                wait_for(lambda: process_name(worker.pid).startswith("next-"))
+            )
+            env = os.environ.copy()
+            env.update(
+                LOFAI_STATE_DIR=str(self.state),
+                LOFAI_RECOVER_ORPHANS="1",
+                LOFAI_STOP_TIMEOUT="1",
+                LOFAI_KILL_TIMEOUT="1",
+            )
+            stopped = subprocess.run(
+                [str(STOP)], env=env, text=True, capture_output=True
+            )
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertTrue(wait_for(lambda: not process_is_live(worker.pid)))
+        finally:
+            if process_is_live(worker.pid):
+                os.killpg(worker.pid, signal.SIGKILL)
+            worker.wait(timeout=2)
 
     def test_terminating_supervisor_stops_all_descendants_and_forces_resistant_one(self):
         backend = self.make_service("backend")
