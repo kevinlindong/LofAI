@@ -246,6 +246,7 @@ function loadStream(addModule, initialStorage = {}) {
 }
 
 const results = []
+const CONTROLS = Object.freeze({ station: "dusty-beats", drums: true })
 async function test(name, exercise) {
   try {
     await exercise()
@@ -264,7 +265,7 @@ await test("destroy prevents a deferred sink from resurrecting", async () => {
   const states = []
   const stream = new runtime.MrtStream((state) => states.push(state))
 
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   assert.equal(runtime.contexts.length, 1)
   assert.equal(runtime.sockets.length, 1)
 
@@ -285,17 +286,11 @@ await test("destroy prevents a deferred sink from resurrecting", async () => {
   assert.equal(runtime.contexts[0].closeCalls, 1, "destroy was not idempotent")
 })
 
-await test("hello and live controls use the listener-planner protocol", async () => {
+await test("hello and live updates use the minimal listener protocol", async () => {
   const runtime = loadStream(() => Promise.resolve())
   const stream = new runtime.MrtStream(() => {})
   const controls = {
     station: "rainy-piano",
-    mood: "somber",
-    instrument: "piano",
-    bpm: 68,
-    groove: 0.4,
-    intensity: 0.28,
-    melody: true,
     drums: false,
   }
   const starting = stream.start(controls)
@@ -311,40 +306,13 @@ await test("hello and live controls use the listener-planner protocol", async ()
   })
 
   const changed = {
-    ...controls,
-    station: "custom",
-    mood: "neutral",
-    bpm: 84,
-    groove: 0.72,
-    intensity: 0.55,
+    station: "jazz-cafe",
     drums: true,
   }
   stream.setControls(changed)
   const messages = socket.sent.slice(1).map((message) => JSON.parse(message))
-  assert.deepEqual(messages[0], {
-    type: "style",
-    station: "custom",
-    mood: "neutral",
-    instrument: "piano",
-  })
-  assert.deepEqual(messages[1], { type: "controls", ...changed })
+  assert.deepEqual(messages, [{ type: "controls", ...changed }])
 
-  await stream.destroy()
-})
-
-await test("legacy mood and instrument overload selects a custom style", async () => {
-  const runtime = loadStream(() => Promise.resolve())
-  const stream = new runtime.MrtStream(() => {})
-  const starting = stream.start("somber", "piano")
-  const socket = runtime.sockets[0]
-  socket.readyState = runtime.WebSocket.OPEN
-  socket.onopen()
-  await starting
-
-  const hello = JSON.parse(socket.sent[0])
-  assert.equal(hello.station, "custom")
-  assert.equal(hello.mood, "somber")
-  assert.equal(hello.instrument, "piano")
   await stream.destroy()
 })
 
@@ -352,7 +320,7 @@ await test("a new take drops old PCM until its fresh-session acknowledgement", a
   const runtime = loadStream(() => Promise.resolve())
   const states = []
   const stream = new runtime.MrtStream((state) => states.push(state))
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   const socket = runtime.sockets[0]
   socket.readyState = runtime.WebSocket.OPEN
   socket.onopen()
@@ -408,7 +376,7 @@ await test("stale session IDs are not replayed and a stale server echo requests 
   })
   const expiredRuntime = loadStream(() => Promise.resolve(), { "lofai.sessionId": expired })
   const expiredStream = new expiredRuntime.MrtStream(() => {})
-  const expiredStart = expiredStream.start("neutral", "guitar")
+  const expiredStart = expiredStream.start(CONTROLS)
   const expiredSocket = expiredRuntime.sockets[0]
   expiredSocket.readyState = expiredRuntime.WebSocket.OPEN
   expiredSocket.onopen()
@@ -419,7 +387,7 @@ await test("stale session IDs are not replayed and a stale server echo requests 
   const current = JSON.stringify({ version: 1, id: "stale-echo", savedAt: Date.now() })
   const runtime = loadStream(() => Promise.resolve(), { "lofai.sessionId": current })
   const stream = new runtime.MrtStream(() => {})
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   const socket = runtime.sockets[0]
   socket.readyState = runtime.WebSocket.OPEN
   socket.onopen()
@@ -444,7 +412,7 @@ await test("stale session IDs are not replayed and a stale server echo requests 
 await test("mastering raises quiet material slowly and keeps volume after the limiter", async () => {
   const runtime = loadStream(() => Promise.resolve())
   const stream = new runtime.MrtStream(() => {})
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   const socket = runtime.sockets[0]
   socket.readyState = runtime.WebSocket.OPEN
   socket.onopen()
@@ -486,7 +454,7 @@ await test("server restart preserves the stream object and schedules reconnect",
   const runtime = loadStream(() => Promise.resolve())
   const states = []
   const stream = new runtime.MrtStream((state) => states.push(state))
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   const socket = runtime.sockets[0]
   socket.readyState = runtime.WebSocket.OPEN
   socket.onopen()
@@ -515,12 +483,6 @@ await test("generation errors stop intent and survive the following suspended st
   const stream = new runtime.MrtStream((state) => states.push(state))
   const controls = {
     station: "dusty-beats",
-    mood: "neutral",
-    instrument: "guitar",
-    bpm: 76,
-    groove: 0.62,
-    intensity: 0.42,
-    melody: true,
     drums: true,
   }
   const starting = stream.start(controls)
@@ -550,7 +512,7 @@ await test("terminal model load failure preserves its message without reconnecti
   const runtime = loadStream(() => Promise.resolve())
   const states = []
   const stream = new runtime.MrtStream((state) => states.push(state))
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   const socket = runtime.sockets[0]
   socket.readyState = runtime.WebSocket.OPEN
   socket.onopen()
@@ -571,7 +533,7 @@ await test("terminal model load failure preserves its message without reconnecti
   assert.equal(states.at(-1).message, "Metal compiler unavailable")
   assert.equal(runtime.contexts[0].state, "running", "stream object was destroyed")
 
-  await stream.start("neutral", "guitar")
+  await stream.start(CONTROLS)
   assert.equal(runtime.sockets.length, 2, "the existing stream object could not retry")
   await stream.destroy()
 })
@@ -579,7 +541,7 @@ await test("terminal model load failure preserves its message without reconnecti
 await test("server shutdown disposes a paused audio graph too", async () => {
   const runtime = loadStream(() => Promise.resolve())
   const stream = new runtime.MrtStream(() => {})
-  const starting = stream.start("neutral", "guitar")
+  const starting = stream.start(CONTROLS)
   const socket = runtime.sockets[0]
   socket.readyState = runtime.WebSocket.OPEN
   socket.onopen()

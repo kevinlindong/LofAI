@@ -106,7 +106,10 @@ class EvaluationSpecTests(unittest.TestCase):
         style = spec.styles[0]
         case = spec.expand()[0]
 
-        self.assertEqual(style.prompt, "dusty lo-fi hip hop beat, warm vinyl, mellow jazz guitar")
+        self.assertEqual(
+            style.prompt,
+            "instrumental mellow lo-fi hip hop, dusty drums, warm jazz guitar, vinyl",
+        )
         self.assertEqual(style.bpm, 76)
         self.assertEqual(style.groove, 0.62)
         self.assertEqual(case.warmup_bars, 1)

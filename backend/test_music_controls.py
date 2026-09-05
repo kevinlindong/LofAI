@@ -47,7 +47,7 @@ class MusicControlTests(unittest.TestCase):
         self.assertEqual(controls.station, "custom")
         self.assertIn("muted trumpet", controls.prompt())
 
-    def test_named_station_cannot_keep_a_contradictory_style_identity(self):
+    def test_named_station_wins_over_stale_legacy_style_fields(self):
         controls = MusicControls.initial(
             station="rainy-piano",
             payload={
@@ -57,10 +57,11 @@ class MusicControlTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(controls.station, styles.CUSTOM_STATION)
-        self.assertEqual(controls.mood, "lively")
-        self.assertEqual(controls.instrument, "brass")
-        self.assertIn("muted trumpet", controls.prompt())
+        preset = styles.STATIONS["rainy-piano"]
+        self.assertEqual(controls.station, preset.slug)
+        self.assertEqual(controls.mood, preset.mood)
+        self.assertEqual(controls.instrument, preset.instrument)
+        self.assertEqual(controls.prompt(), preset.prompt)
 
     def test_audio_reference_requires_an_existing_station_wav(self):
         with tempfile.TemporaryDirectory() as directory:

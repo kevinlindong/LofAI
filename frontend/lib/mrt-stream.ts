@@ -41,23 +41,11 @@ export interface StreamState {
 
 export interface ListenerControls {
   station: string
-  mood: string
-  instrument: string
-  bpm: number
-  groove: number
-  intensity: number
-  melody: boolean
   drums: boolean
 }
 
 export const DEFAULT_LISTENER_CONTROLS: ListenerControls = {
   station: "dusty-beats",
-  mood: "neutral",
-  instrument: "guitar",
-  bpm: 76,
-  groove: 0.62,
-  intensity: 0.42,
-  melody: true,
   drums: true,
 }
 
@@ -71,26 +59,24 @@ interface Reservoir {
 // how deep to bank before playing, as a function of how much faster than real
 // time the backend says it is rendering.
 //
-// a machine with headroom needs only enough to cover jitter, and making that
-// listener wait five seconds for their first note is pure loss. a machine that
-// cannot hold real time gets a deeper bank, but playback stays at 1.0x in every
-// tier so the melody never changes pitch as that bank moves.
+// A buffer cannot repair a renderer that is permanently below 1x; it can only
+// postpone the gap. Keep latency below a second and let the backend lower one
+// codec layer when measured throughput actually needs it.
 function reservoirFor(realtimeFactor: number): Reservoir {
   if (realtimeFactor <= 0) {
-    // nothing measured yet - the backend has not rendered for us
-    return { prebufferSeconds: 2.5, rebufferSeconds: 2, comfortSeconds: 4, minRate: 1 }
+    return { prebufferSeconds: 0.8, rebufferSeconds: 0.8, comfortSeconds: 1.6, minRate: 1 }
   }
-  if (realtimeFactor >= 1.15) {
-    return { prebufferSeconds: 1.0, rebufferSeconds: 1.0, comfortSeconds: 2.5, minRate: 1 }
+  if (realtimeFactor >= 1.18) {
+    return { prebufferSeconds: 0.64, rebufferSeconds: 0.8, comfortSeconds: 1.4, minRate: 1 }
   }
   if (realtimeFactor >= 1.0) {
-    return { prebufferSeconds: 3, rebufferSeconds: 2.5, comfortSeconds: 5, minRate: 1 }
+    return { prebufferSeconds: 0.9, rebufferSeconds: 1.0, comfortSeconds: 1.8, minRate: 1 }
   }
-  return { prebufferSeconds: 6, rebufferSeconds: 5, comfortSeconds: 8, minRate: 1 }
+  return { prebufferSeconds: 1.2, rebufferSeconds: 1.4, comfortSeconds: 2.2, minRate: 1 }
 }
 
 const WORKLET_URL = "/mrt-pcm-worklet.js"
-const RING_SECONDS = 45
+const RING_SECONDS = 8
 const FATAL_SERVER_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1011])
 const SESSION_MAX_AGE_MS = 4 * 60 * 1000
 
@@ -176,37 +162,17 @@ function normalizedControls(
   next: Partial<ListenerControls>,
   previous: ListenerControls = DEFAULT_LISTENER_CONTROLS,
 ): ListenerControls {
-  const finite = (value: unknown, fallback: number) =>
-    typeof value === "number" && Number.isFinite(value) ? value : fallback
   return {
     station:
       typeof next.station === "string" && next.station.trim()
         ? next.station.trim()
         : previous.station,
-    mood: typeof next.mood === "string" && next.mood ? next.mood : previous.mood,
-    instrument:
-      typeof next.instrument === "string" && next.instrument
-        ? next.instrument
-        : previous.instrument,
-    bpm: Math.round(clamp(finite(next.bpm, previous.bpm), 60, 110)),
-    groove: clamp(finite(next.groove, previous.groove), 0, 1),
-    intensity: clamp(finite(next.intensity, previous.intensity), 0, 1),
-    melody: typeof next.melody === "boolean" ? next.melody : previous.melody,
     drums: typeof next.drums === "boolean" ? next.drums : previous.drums,
   }
 }
 
 function controlsEqual(a: ListenerControls, b: ListenerControls): boolean {
-  return (
-    a.station === b.station &&
-    a.mood === b.mood &&
-    a.instrument === b.instrument &&
-    a.bpm === b.bpm &&
-    a.groove === b.groove &&
-    a.intensity === b.intensity &&
-    a.melody === b.melody &&
-    a.drums === b.drums
-  )
+  return a.station === b.station && a.drums === b.drums
 }
 
 function dbToGain(db: number): number {
@@ -511,21 +477,9 @@ export class MrtStream {
 
   // --- public api ---
 
-  async start(controls: ListenerControls): Promise<void>
-  async start(mood: string, instrument: string): Promise<void>
-  async start(controlsOrMood: ListenerControls | string, instrument?: string) {
+  async start(controls: ListenerControls) {
     if (this.destroyed) return
-    this.controls =
-      typeof controlsOrMood === "string"
-        ? normalizedControls(
-            {
-              station: "custom",
-              mood: controlsOrMood,
-              instrument: instrument ?? this.controls.instrument,
-            },
-            this.controls,
-          )
-        : normalizedControls(controlsOrMood, this.controls)
+    this.controls = normalizedControls(controls, this.controls)
     this.wantsAudio = true
     if (this.suspendTimer) {
       clearTimeout(this.suspendTimer)
@@ -582,33 +536,11 @@ export class MrtStream {
     this.patch({ status: "paused", bufferProgress: 0 })
   }
 
-  setStyle(mood: string, instrument: string, station = "custom") {
-    if (this.destroyed) return
-    this.controls = normalizedControls({ mood, instrument, station }, this.controls)
-    this.send({ type: "style", mood, instrument, station })
-  }
-
   setControls(next: ListenerControls) {
     if (this.destroyed) return
     const controls = normalizedControls(next, this.controls)
     if (controlsEqual(controls, this.controls)) return
-
-    const styleChanged =
-      controls.station !== this.controls.station ||
-      controls.mood !== this.controls.mood ||
-      controls.instrument !== this.controls.instrument
     this.controls = controls
-
-    // Keep old servers useful during rollout. New servers consume the complete
-    // planner control block; old ones still understand the style message.
-    if (styleChanged) {
-      this.send({
-        type: "style",
-        station: controls.station,
-        mood: controls.mood,
-        instrument: controls.instrument,
-      })
-    }
     this.send({ type: "controls", ...controls })
   }
 
@@ -783,9 +715,11 @@ export class MrtStream {
 
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 2048
-    // the visualiser draws one dot column per bin group; without smoothing the
-    // ring flickers a whole ring-step between frames
-    analyser.smoothingTimeConstant = 0.75
+    // some smoothing, or the ring flickers a whole ring-step between frames -
+    // but not much: the visualiser runs its own attack and release over these
+    // numbers, and heavy smoothing here rounds the transients off before it
+    // ever sees them
+    analyser.smoothingTimeConstant = 0.55
 
     inputMeter.connect(normalizer)
     normalizer.connect(limiter)
@@ -958,9 +892,9 @@ export class MrtStream {
     this.persistSessionId()
     // Let the tuner recover while audio remains instead of waiting until the
     // listener hears a gap. Reports are frequent, so match the server's dwell.
-    if (report.playing && report.buffered < 0.75) {
+    if (report.playing && report.buffered < 0.3) {
       const now = performance.now()
-      if (now - this.lastPressureAt >= 6000) {
+      if (now - this.lastPressureAt >= 4000) {
         this.lastPressureAt = now
         this.send({ type: "pressure" })
       }
@@ -1164,8 +1098,8 @@ export class MrtStream {
         }
 
         if (this.backendActive && !wasActive && this.wantsAudio) {
-          // A freshly playing one-second bank naturally dips while the second
-          // chunk renders. Give that sawtooth a full feedback interval before
+          // A freshly playing bank naturally dips while the next chunk renders.
+          // Give that sawtooth a full feedback interval before
           // treating low water as sustained pressure.
           this.lastPressureAt = performance.now()
           this.sink?.play(true)

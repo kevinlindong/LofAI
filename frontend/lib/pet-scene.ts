@@ -85,6 +85,11 @@ export interface PetFrame {
   phase: number
   // the music is playing: notes, a busier tail, a head that keeps time
   notes: boolean
+  // 0..1, how far into the music the cat is. `notes` is the switch, this is
+  // the ramp behind it: the bop lifts the loaf off the ground between beats,
+  // and a lift that appeared the frame the first note landed would be a jump
+  // rather than a cat settling into the groove.
+  groove: number
   // 0..1, celebration sparkles fading out
   sparkle: number
   // where the cat is looking, -1..1 across its field of view. this is the
@@ -104,6 +109,7 @@ export const IDLE_FRAME: PetFrame = {
   pat: 0,
   phase: 0,
   notes: false,
+  groove: 0,
   sparkle: 0,
   gazeX: 0,
   gazeY: 0,
@@ -255,7 +261,17 @@ function poseBody(f: PetFrame) {
   // correct animation and wrong here: it stacks with the lift and puts the ear
   // tips through the top of the panel.
   const springy = f.hop * 0.9 - f.bob * 0.7 - f.pat * 0.6
-  const wide = 1 - springy * (springy > 0 ? 0.18 : 0.34)
+  // the width gets its own, much smaller, share of the beat.
+  //
+  // `wide` spreads the blobs out from the middle, so what it does to the
+  // outline depends on how far out they already sit. the number was tuned on a
+  // sitting cat whose body was four dots either side of centre, where a beat
+  // moved the outline by one; the loaf that replaced it reaches twelve, where
+  // the same number moves it by five. a cat that shortens by two and widens by
+  // one is dipping to the music. the same cat widening by five is a pancake,
+  // and that - not the shortening - is what went wrong with the bop.
+  const spread = f.hop * 0.9 - f.bob * 0.12 - f.pat * 0.6
+  const wide = 1 - spread * (spread > 0 ? 0.18 : 0.34)
   const tall = 1 + (springy < 0 ? springy * 0.17 : 0)
   const rScale = 1 + springy * 0.05
   // whole dots. everything that carries a marking - the head with its face on
@@ -265,7 +281,21 @@ function poseBody(f: PetFrame) {
   // and the result reads as a fault rather than as motion. the shape changes -
   // the squash, the ear flick, the tail - stay continuous, because nothing is
   // struck onto them.
-  const lift = Math.round(f.hop * 2.4 - f.bob * 1.0 - f.pat * 0.7)
+  //
+  // the beat is the exception, and it is the whole of the bop. a hop and a
+  // hand are events - they land on a dot and stay there for a moment, so they
+  // round. a beat is a ride: the loaf settles into the ground and comes back
+  // up twice a second, and rounding that is what turned the bop into a switch
+  // between a flat pose and a normal one. it stays continuous, and the
+  // silhouette glides even though the markings on it still land on whole dots.
+  //
+  // and the bounce sits on top of it. between beats the loaf rides up off the
+  // ground and each beat sets it back down, rather than the other way about:
+  // the field is cut off flat along the ground, so a loaf pressed *into* it
+  // loses its bottom rows to the cut instead of moving, and what should have
+  // been a bounce came out as a spread. going up is not cut, so the whole
+  // animal travels. the small term the other way is the beat itself landing.
+  const lift = Math.round(f.hop * 2.4 - f.pat * 0.7) + f.groove * (1 - f.bob) * 1.2 - f.bob * 0.4
   const breath = Math.sin(f.phase * (f.mood === "sleep" ? 0.7 : 1.15)) * 0.2
   tailFlick = Math.sin(f.phase * (1.2 + f.bob * 2.6)) * (0.7 + f.bob * 1.7)
 
@@ -321,6 +351,11 @@ function poseBody(f: PetFrame) {
   const sag = Math.round(lean * 0.25)
   headR = 5.0 * rScale
   headX = Math.round(HEAD_X + lean + sway)
+  // no beat term here. the head rides on `up`, which carries the lift, so it
+  // already goes down and comes back with the rest of the animal - and a cat
+  // bopping moves in one piece. a beat added on top of that sinks the head
+  // into the shoulders instead, which is a cat being pressed rather than a cat
+  // keeping time, and it costs the chest the three dots it has.
   headY = Math.round(up(14.0) + nod)
   const skull = 2.2 * wide + (f.mood === "happy" || f.mood === "cheer" ? 0.4 : 0)
   head(headX - skull, headY, headR)

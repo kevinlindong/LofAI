@@ -127,7 +127,7 @@ class ConditioningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "full precision"):
             self.engine._load_python()
 
-    def test_session_combines_style_score_and_drum_boundaries_without_losing_frames(self):
+    def test_live_session_uses_prompt_only_conditioning_without_losing_frames(self):
         class PlanEngine:
             def embed(self, _prompt):
                 return np.zeros(768, dtype=np.float32)
@@ -136,8 +136,8 @@ class ConditioningTests(unittest.TestCase):
         plan = session.conditioning_plan(PlanEngine(), 75)
 
         self.assertEqual(sum(run.frames for run in plan), 75)
-        self.assertTrue(any(2 in run.notes.tokens for run in plan))
-        self.assertTrue(any(run.drum in (-1, 1) for run in plan))
+        self.assertTrue(all(run.notes is None for run in plan))
+        self.assertTrue(all(run.drum is None for run in plan))
         self.assertTrue(all(run.frames > 0 for run in plan))
         self.assertEqual(session.conditioning_plan(PlanEngine(), 0), [])
 

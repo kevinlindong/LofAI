@@ -43,7 +43,7 @@ class SpeedEngine:
 
 
 class SessionControlTests(unittest.TestCase):
-    def test_station_and_planner_controls_reach_one_conditioning_plan(self):
+    def test_station_and_live_controls_reach_one_prompt_only_plan(self):
         session = Session(
             "controls",
             "neutral",
@@ -56,8 +56,9 @@ class SessionControlTests(unittest.TestCase):
         plan = session.conditioning_plan(PlanEngine(), 100)
 
         self.assertEqual(sum(run.frames for run in plan), 100)
+        self.assertTrue(all(run.notes is None for run in plan))
         self.assertTrue(all(run.drum == 0 for run in plan))
-        self.assertEqual(session.melody.composition.settings.bpm, 88)
+        self.assertEqual(session.control_payload()["bpm"], 88)
         self.assertEqual(session.control_payload()["groove"], 0.8)
 
     def test_new_variation_changes_seed_and_invalidates_inflight_render(self):
@@ -71,7 +72,7 @@ class SessionControlTests(unittest.TestCase):
         self.assertFalse(session.render_is_current(epoch))
         next_epoch = session.prepare_render()
         self.assertTrue(session.render_is_current(next_epoch))
-        self.assertEqual(session.melody.seed & 0xFFFFFFFF, new_seed)
+        self.assertEqual(session.seed, new_seed)
 
     def test_deferred_old_pcm_is_dropped_after_variation_ack(self):
         session = Session("old-pcm", "neutral", "guitar")
@@ -87,44 +88,26 @@ class SessionControlTests(unittest.TestCase):
         self.assertFalse(delivered)
         self.assertEqual(queued, ["variation-ack"])
 
-    def test_style_and_harmony_change_together_at_a_bar_boundary(self):
-        session = Session("bar-change", "neutral", "guitar")
+    def test_style_change_starts_on_the_next_chunk(self):
+        session = Session("prompt-change", "neutral", "guitar")
         engine = PlanEngine()
         session.conditioning_plan(engine, 10)
         session.request_controls({"mood": "lively", "instrument": "brass"})
-        boundary = session.control_boundary_frames(200)
 
-        self.assertGreater(boundary, 0)
-        session.conditioning_plan(engine, boundary)
-        self.assertEqual(session.melody.composition.settings.mood, "neutral")
+        plan = session.conditioning_plan(engine, 20)
+        self.assertIn("bright upbeat", session._active_prompt)
+        self.assertIn("muted trumpet", session._active_prompt)
+        self.assertIn("bright upbeat", plan[-1].key)
 
-        session.conditioning_plan(engine, 1)
-        self.assertEqual(session.melody.composition.settings.mood, "lively")
-
-    def test_rhythm_and_arrangement_controls_also_latch_on_the_bar(self):
-        session = Session("bar-arrangement", "neutral", "guitar")
+    def test_drum_mute_applies_on_the_next_chunk(self):
+        session = Session("drum-mute", "neutral", "guitar")
         engine = PlanEngine()
         session.conditioning_plan(engine, 10)
-        original_bpm = session.melody.composition.active_settings.bpm
-        session.request_controls({"bpm": 96, "intensity": 0.8, "groove": 0.82})
-        boundary = session.control_boundary_frames(200)
+        session.request_controls({"bpm": 96, "drums": False})
 
-        session.conditioning_plan(engine, boundary)
-        self.assertEqual(session.melody.composition.active_settings.bpm, original_bpm)
-        session.conditioning_plan(engine, 1)
-        active = session.melody.composition.active_settings
-        self.assertEqual(active.bpm, 96)
-        self.assertEqual(active.intensity, 0.8)
-        self.assertEqual(active.groove, 0.82)
-
-    def test_first_sixteenth_is_not_mistaken_for_the_whole_bar_boundary(self):
-        session = Session("narrow-boundary", "neutral", "guitar")
-        clock = session.melody.composition.clock
-        bpm = session.melody.composition.active_settings.resolved_bpm
-        clock.step_position = 16.25
-        clock.last_position = clock.position(bpm)
-
-        self.assertGreater(session._frames_to_bar(), 1)
+        plan = session.conditioning_plan(engine, 20)
+        self.assertTrue(all(run.drum == 0 for run in plan))
+        self.assertEqual(session.control_payload()["bpm"], 96)
 
     def test_returning_to_active_style_cancels_pending_bar_change(self):
         session = Session("cancel-style", "neutral", "guitar")
@@ -135,9 +118,9 @@ class SessionControlTests(unittest.TestCase):
         session.request_controls({"mood": "neutral", "instrument": "guitar"})
 
         self.assertIsNone(session._pending_style)
-        self.assertEqual(session.control_boundary_frames(200), 200)
         session.conditioning_plan(engine, 200)
-        self.assertEqual(session.melody.composition.settings.mood, "neutral")
+        self.assertIn("warm mellow", session._active_prompt)
+        self.assertIn("jazz guitar", session._active_prompt)
 
     def test_new_variation_starts_directly_on_requested_style(self):
         session = Session(
@@ -154,7 +137,7 @@ class SessionControlTests(unittest.TestCase):
         self.assertIsNone(session._pending_style)
         self.assertFalse(session._ramping)
         self.assertIn("intimate felt piano", plan[0].key)
-        self.assertEqual(session.melody.composition.settings.station, "rainy-piano")
+        self.assertEqual(session.station, "rainy-piano")
 
     def test_missing_stale_id_is_replaced_instead_of_reseeding_it(self):
         manager = SessionManager()

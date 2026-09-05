@@ -1,15 +1,17 @@
 # magenta realtime 2 inference engine
 
-import logging
-import os
 import hashlib
 import importlib.metadata
-from pathlib import Path
+import logging
+import os
 import tempfile
 import threading
 import time
+import warnings
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -18,6 +20,18 @@ from audio_quality import require_startup_pcm_quality
 from melody import piano_roll
 
 log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _ignore_upstream_shape_probe_warnings():
+    """Hide warnings caused by SequenceLayers reducing an unfilled shape dummy."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"(invalid value|overflow) encountered in reduce",
+            category=RuntimeWarning,
+        )
+        yield
 
 
 class EngineStopping(RuntimeError):
@@ -56,23 +70,16 @@ FRAME_SECONDS = 1.0 / FRAMES_PER_SECOND
 # them one after another, so the codebook count is very nearly a dial on how
 # long a frame takes to render: about 1.1ms of a 40ms budget each on an m1.
 #
-# Eight layers still decodes, but same-seed listening diagnostics found a much
-# darker, bass-heavier balance there than at full depth. Skipped tokens also
-# enter the next temporal state, so this is not a free high-frequency-only
-# trade. Listener-facing generation therefore keeps at least ten by default
-# and always restores the highest count the machine can sustain.
+# Ten layers preserves the useful codec detail on the M1 Air while leaving the
+# runtime tuner one inexpensive step to spend if the browser reports pressure.
 MAX_CODEBOOKS = 12
-# Eight layers keeps gross codec metrics intact, but listening diagnostics show
-# that it materially darkens the mix and the dummy tail also feeds the next
-# recurrent state. Ten is the default floor for listener-facing audio. An
-# explicit environment override can still lower it for controlled experiments.
 MIN_CODEBOOKS = 10
 ABSOLUTE_MIN_CODEBOOKS = 8
 
 # Frames per calibration probe. One global burn-in fills kernels, then each
-# candidate is measured on the same one-second transport granularity listeners
-# receive. Long enough that one slow frame does not decide the answer, while a
-# full walk to the configured floor still adds only a few seconds to startup.
+# candidate is measured over a full second so pipeline startup noise and one
+# unusually slow frame do not decide the answer. A full walk to the configured
+# floor still adds only a few seconds to startup.
 PROBE_FRAMES = 25
 
 # how long the tuner sits still after a change. long enough that the estimate
@@ -127,8 +134,8 @@ class MRTEngine:
         self.size = os.environ.get("MRT_MODEL_SIZE", "mrt2_small")
         # "python" builds the model from the safetensors checkpoint and runs it
         # eagerly. "mlxfn" runs a graph exported by `mrt mlx export`, which is
-        # nominally faster - but every graph exported by mlx 0.32.x (the newest
-        # on pypi) decodes to white noise: no energy below 200hz, 91% above
+        # nominally faster - but every graph exported by the tested MLX 0.32.x
+        # builds decodes to white noise: no energy below 200hz, 91% above
         # 4khz, zero crossing rate 0.50. that reproduces through the library's
         # own `mrt mlx generate` CLI, at 8-bit and unquantized, and with 0, 1
         # and 2 cfg branches, so it is the exporter and not this app. the same
@@ -136,14 +143,20 @@ class MRTEngine:
         # all. keep the eager path until a newer mlx ships; whatever the export
         # was worth, the eager path pipelines now and has closed some of it.
         self.backend = os.environ.get("MRT_BACKEND", "python")
-        self.bits = _env_int("MRT_BITS", 8)
-        # Start at Magenta's listener UI centre. These are still exposed as
-        # controls and evaluated perceptually; they are not universal optima.
-        self.temperature = _env_float("MRT_TEMPERATURE", 1.1)
-        self.top_k = _env_int("MRT_TOP_K", 50)
-        self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 1.6)
-        self.cfg_notes = _env_float("MRT_CFG_NOTES", 2.4)
-        self.cfg_drums = _env_float("MRT_CFG_DRUMS", 4.0)
+        # Four-bit weights are the best live trade on the baseline 8 GB M1:
+        # they load in roughly half the time and leave enough margin to retain
+        # 10-12 codec layers. Codec-layer truncation is reserved for measured
+        # pressure because it also changes the recurrent audio-token history.
+        self.bits = _env_int("MRT_BITS", 4)
+
+        # Match magentart::core's live defaults. The former 1.1/50/1.6/2.4/4
+        # combination over-constrained drums and reduced the sampler's useful
+        # choices without buying throughput (CFG is encoded as tokens here).
+        self.temperature = _env_float("MRT_TEMPERATURE", 1.0)
+        self.top_k = _env_int("MRT_TOP_K", 100)
+        self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 3.0)
+        self.cfg_notes = _env_float("MRT_CFG_NOTES", 5.0)
+        self.cfg_drums = _env_float("MRT_CFG_DRUMS", 1.0)
 
         # The official live engine keeps the coarse half of MusicCoCa's RVQ
         # tokens and masks its fine tail. Broad musical style survives while
@@ -161,7 +174,7 @@ class MRTEngine:
         # and they are audible, so the aim is enough headroom to ride out a
         # wobble - not enough to never think about it again. gaps the listener
         # actually reports buy an extra step down, which is the honest signal.
-        self.target_rtf = _env_float("MRT_TARGET_RTF", 1.15)
+        self.target_rtf = _env_float("MRT_TARGET_RTF", 1.18)
         self.mlx_cache_mb = _env_int("MRT_MLX_CACHE_MB", 384)
         self.fast_sampler_enabled = _env_int("MRT_FAST_SAMPLER", 1) != 0
 
@@ -185,7 +198,7 @@ class MRTEngine:
         self._style_tokens: dict[tuple[str, int], tuple[int, ...]] = {}
         self._blocks: OrderedDict[tuple, tuple] = OrderedDict()
         self.conditioning_cache_size = max(
-            64, _env_int("MRT_CONDITIONING_CACHE_SIZE", 2048)
+            64, _env_int("MRT_CONDITIONING_CACHE_SIZE", 128)
         )
         self.audio_style_blend = max(
             0.0, min(1.0, _env_float("MRT_AUDIO_STYLE_BLEND", 0.75))
@@ -200,9 +213,11 @@ class MRTEngine:
         self._sampler = None
         self._input_spec = None
         self._depth_config = None
+        self._keepalive_value = None
 
         # recent render cost in seconds per frame, for the auto-tuner
         self._costs: deque[float] = deque(maxlen=COST_WINDOW)
+        self._last_known_cost = 0.0
         self._cost_lock = threading.Lock()
         self._active_streams = 1
         self._last_tune = 0.0
@@ -241,8 +256,9 @@ class MRTEngine:
     def _typical_cost(self) -> float:
         with self._cost_lock:
             costs = tuple(self._costs)
+            fallback = self._last_known_cost
         if not costs:
-            return 0.0
+            return fallback
         ordered = sorted(costs)
         return ordered[len(ordered) // 2]
 
@@ -253,9 +269,13 @@ class MRTEngine:
             self._costs.clear()
             for _ in range(COST_WINDOW):
                 self._costs.append(cost)
+            self._last_known_cost = cost
 
     def _clear_costs(self):
         with self._cost_lock:
+            if self._costs:
+                ordered = sorted(self._costs)
+                self._last_known_cost = ordered[len(ordered) // 2]
             self._costs.clear()
 
     def prepare_start(self):
@@ -323,6 +343,7 @@ class MRTEngine:
             },
         )
 
+    @_ignore_upstream_shape_probe_warnings()
     def _load_python(self):
         # model built and quantized at load time from the safetensors checkpoint
         from magenta_rt.mlx.system import MagentaRT2System
@@ -332,6 +353,8 @@ class MRTEngine:
 
         precision = "full precision" if self.bits == 0 else f"{self.bits}-bit"
         log.info("loading %s (python backend, %s)", self.size, precision)
+        # SequenceLayers asks NumPy for the *shape* of a mean over an unfilled
+        # dummy array while materializing deferred layers. No value is consumed.
         return MagentaRT2System(
             size=self.size,
             bits=self.bits or None,
@@ -359,6 +382,7 @@ class MRTEngine:
             # to rediscover it
             self._mx = mx
             self._sl = sl
+            self._keepalive_value = mx.array([0.0], dtype=mx.float32)
 
             if self.fast_sampler_enabled:
                 try:
@@ -687,8 +711,8 @@ class MRTEngine:
             return
 
         # One global burn-in is enough: changing the active count changes loop
-        # length, not tensor/kernel shapes. Probe at the real 25-frame chunk
-        # size so pipeline-drain overhead is represented accurately.
+        # length, not tensor/kernel shapes. A 25-frame probe gives calibration
+        # a stable throughput estimate; live chunks are shorter for latency.
 
         if self.pinned_codebooks:
             self.set_codebooks(self.pinned_codebooks)
@@ -740,6 +764,13 @@ class MRTEngine:
         started = time.monotonic()
         pcm, state = self.generate(state, plan)
         return (time.monotonic() - started) / PROBE_FRAMES, state, pcm
+
+    def keep_gpu_warm(self):
+        """Prevent Metal from downclocking between real-time render bursts."""
+        if not self._fast or self._keepalive_value is None:
+            return
+        value = self._keepalive_value
+        self._mx.eval(value + value)
 
     def _require_audio_quality(self, chunks: list[bytes]):
         report = require_startup_pcm_quality(
@@ -864,6 +895,7 @@ class MRTEngine:
             return style, key, notes, frames, drum, sampling
         raise ValueError("conditioning run must have 4, 5, or 6 values")
 
+    @_ignore_upstream_shape_probe_warnings()
     def generate(self, state, plan, seed: int | None = None):
         # render one chunk, returning interleaved int16 pcm and the next state
         #
@@ -877,21 +909,7 @@ class MRTEngine:
         mx = self._mx
         sampler = self._sampler
         if state is None:
-            state = sampler.get_initial_state(
-                1, self._input_spec, constants={}, training=False
-            )
-            if seed is not None:
-                streaming_state = state[0]
-                _rng, previous, temporal, step = streaming_state[2]
-                rng = mx.stack([mx.random.key(int(seed) & 0xFFFFFFFF)])
-                seeded_decoder = (rng, previous, temporal, step)
-                seeded_streaming = (
-                    streaming_state[0],
-                    streaming_state[1],
-                    seeded_decoder,
-                    streaming_state[3],
-                )
-                state = (seeded_streaming, *state[1:])
+            state = self._new_eager_state(seed)
 
         outputs = []
         # the graph mlx is still working on. handing it to async_eval and only
@@ -1024,11 +1042,14 @@ class MRTEngine:
         self._sampler = None
         self._input_spec = None
         self._depth_config = None
+        self._keepalive_value = None
         self._system = None
         self._fast = False
         self._fast_sampling = False
         self._active_streams = 1
-        self._clear_costs()
+        with self._cost_lock:
+            self._costs.clear()
+            self._last_known_cost = 0.0
 
         mx = getattr(self, "_mx", None)
         if mx is not None:

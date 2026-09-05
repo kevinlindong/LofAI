@@ -18,10 +18,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("lofai")
 
-# how much audio we hold for a client that has stopped draining. the lookahead
-# cap means a healthy session never banks more than a few seconds here, so this
-# is insurance against a wedged socket rather than a working buffer.
-OUTBOX_LIMIT = max(4, int(30.0 / manager_mod.CHUNK_SECONDS))
+# This queue is transport slack, not another playback buffer. A healthy socket
+# drains it immediately; four seconds is ample to identify a suspended tab
+# without retaining half a minute of stale music.
+OUTBOX_LIMIT = max(4, int(4.0 / manager_mod.CHUNK_SECONDS))
 
 manager = manager_mod.SessionManager()
 

@@ -77,8 +77,10 @@ class MusicControls:
     ) -> "MusicControls":
         next_controls = self
         raw_station = payload.get("station")
+        explicit_named_station = False
         if isinstance(raw_station, str):
             station = styles.normalize_station(raw_station)
+            explicit_named_station = station != styles.CUSTOM_STATION
             if station != self.station and apply_station_defaults:
                 if station == styles.CUSTOM_STATION:
                     next_controls = replace(next_controls, station=station)
@@ -96,10 +98,17 @@ class MusicControls:
             else:
                 next_controls = replace(next_controls, station=station)
 
-        mood, instrument = styles.normalize(
-            payload.get("mood", next_controls.mood),
-            payload.get("instrument", next_controls.instrument),
-        )
+        # A station is one coherent MusicCoCa target. When it is explicitly
+        # selected it wins over stale legacy mood/instrument fields that an old
+        # client may still include in the same control snapshot.
+        if explicit_named_station:
+            preset = styles.station_defaults(raw_station)
+            mood, instrument = preset.mood, preset.instrument
+        else:
+            mood, instrument = styles.normalize(
+                payload.get("mood", next_controls.mood),
+                payload.get("instrument", next_controls.instrument),
+            )
         # Manually steering either legacy axis makes the result a custom mix,
         # unless the client explicitly included the station in this message.
         station = next_controls.station
@@ -107,17 +116,6 @@ class MusicControls:
             "mood" in payload or "instrument" in payload
         ):
             station = styles.CUSTOM_STATION
-        elif station != styles.CUSTOM_STATION:
-            preset = styles.station_defaults(station)
-            contradicts_named_style = (
-                "mood" in payload and mood != preset.mood
-            ) or (
-                "instrument" in payload and instrument != preset.instrument
-            )
-            if contradicts_named_style:
-                # A named prompt has a fixed mood/timbre identity. Do not let a
-                # non-UI client silently pair it with a contradictory planner.
-                station = styles.CUSTOM_STATION
 
         return replace(
             next_controls,

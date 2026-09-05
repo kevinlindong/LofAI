@@ -84,8 +84,8 @@ export default function LofiGenerator() {
     }
   }, [])
 
-  // The stream retains this state before connecting, then sends the complete
-  // planner block whenever a listener changes a control.
+  // The stream retains this state before connecting, then sends one small
+  // station/drum update whenever the listener changes it.
   useEffect(() => {
     streamRef.current?.setControls(controls)
   }, [controls])

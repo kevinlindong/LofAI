@@ -7,7 +7,6 @@ import time
 from collections import deque
 
 import engine as engine_mod
-import session as session_mod
 import styles
 from session import ACTIVE, QUEUED, SUSPENDED, Session
 
@@ -28,20 +27,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# audio generated per model call.
-#
-# this is not a throughput knob - per-call overhead measures flat from 10 to 100
-# frames - but it is a pipelining one. 25 frames keeps the GPU pipeline useful
-# while bounding startup, control, and transport latency to one second. The old
-# 50-frame burst saved only a couple of percentage points but could overshoot
-# the reservoir (and delay a style request) by almost two seconds.
-CHUNK_FRAMES = _env_int("MRT_CHUNK_FRAMES", 25)
+# Audio generated per model call. Ten frames stays about 1.17x real time on the
+# baseline M1 while halving the control granularity of the former 20-frame call.
+CHUNK_FRAMES = max(1, _env_int("MRT_CHUNK_FRAMES", 10))
 CHUNK_SECONDS = CHUNK_FRAMES / engine_mod.FRAMES_PER_SECOND
 
-# One second exactly meets the fast client's prebuffer in a single call. The
-# former 12->24 growth needed two calls to cross that threshold and then risked
-# draining the small bank while its much larger third call rendered.
-FIRST_CHUNK_FRAMES = _env_int("MRT_FIRST_CHUNK_FRAMES", 25)
+# Use one shorter first burst, then the steady batch size. This gives the
+# browser early progress without keeping the inefficient one-frame cadence.
+FIRST_CHUNK_FRAMES = max(1, _env_int("MRT_FIRST_CHUNK_FRAMES", 8))
 
 # how far ahead of the wall clock a session may run. this is the reservoir the
 # client drinks from, and it is also the dominant term in control latency: audio
@@ -52,7 +45,7 @@ FIRST_CHUNK_FRAMES = _env_int("MRT_FIRST_CHUNK_FRAMES", 25)
 # its own prebuffer when measured speed is close to the line. This server-side
 # lead mainly covers scheduling jitter and bounds how stale a style change can
 # be.
-LOOKAHEAD_SECONDS = _env_float("MRT_LOOKAHEAD_SECONDS", 2.0)
+LOOKAHEAD_SECONDS = max(0.0, _env_float("MRT_LOOKAHEAD_SECONDS", 0.4))
 
 # concurrent streams. one model instance serves all of them from one thread, so
 # this is bounded by how much faster than real time the model runs. watch
@@ -67,6 +60,7 @@ MAX_TOTAL = max(MAX_ACTIVE, _env_int("MRT_MAX_SESSIONS_TOTAL", 8))
 
 # longest the worker sleeps when nobody needs audio
 IDLE_WAIT = 0.25
+GPU_KEEPALIVE_SECONDS = 0.02
 
 
 class SessionManager:
@@ -264,7 +258,7 @@ class SessionManager:
             return session, False
 
     def new_variation(self, session: Session) -> tuple[str, int]:
-        """Give a live session a fresh id, seed, score, and model state.
+        """Give a live session a fresh id, seed, and model state.
 
         The actual MLX state is released by the worker.  Changing the render
         epoch here makes any inference already in flight discard its output.
@@ -492,7 +486,7 @@ class SessionManager:
             # current allocation but admit no additional streams until fresh
             # evidence arrives.
             return max(1, min(MAX_ACTIVE, len(self._active)))
-        target = max(1.0, float(getattr(self.engine, "target_rtf", 1.15)))
+        target = max(1.0, float(getattr(self.engine, "target_rtf", 1.18)))
         sustainable = max(1, int(factor / target))
         return min(MAX_ACTIVE, sustainable)
 
@@ -566,7 +560,7 @@ class SessionManager:
                 "cfgNotes": self.engine.cfg_notes,
                 "cfgDrums": self.engine.cfg_drums,
                 "styleTokenLevels": self.engine.style_token_levels,
-                "melodyGuided": session_mod.MELODY_GUIDE_ENABLED,
+                "melodyGuided": False,
                 "mlxCacheLimitMB": self.engine.mlx_cache_mb,
                 "pipelined": self.engine._fast,
                 "fastSampler": self.engine._fast_sampling,
@@ -617,15 +611,22 @@ class SessionManager:
                     # than waking a hundred times a second to find out it does not
                     self._wake.wait(self._idle_wait())
                     self._wake.clear()
+                    # Magenta's native runner keeps Metal awake between bursts.
+                    # Without this, macOS downclocks the M1 GPU and the next
+                    # frame can lose the small margin that makes it real time.
+                    with self._lock:
+                        active = bool(self._active)
+                    keep_warm = getattr(self.engine, "keep_gpu_warm", None)
+                    if active and keep_warm is not None:
+                        keep_warm()
                     continue
 
                 maximum_frames = self._chunk_frames(session)
                 started = time.monotonic()
                 try:
                     render_epoch = session.prepare_render()
-                    frames, plan = session.prepare_conditioning(
-                        self.engine, maximum_frames
-                    )
+                    frames = maximum_frames
+                    plan = session.conditioning_plan(self.engine, frames)
                     pcm, next_state = self.engine.generate(
                         session.state, plan, seed=session.seed
                     )
@@ -741,14 +742,11 @@ class SessionManager:
             session.release_state()
 
     def _chunk_frames(self, session: Session) -> int:
-        # start small and double into full chunks: the reservoir is empty at
-        # the top of a session, and a listener would otherwise wait a whole
-        # chunk for a sound that a tenth of one could have started
-        if session.chunks_rendered >= 3:
-            frames = CHUNK_FRAMES
-        else:
-            frames = min(CHUNK_FRAMES, FIRST_CHUNK_FRAMES << session.chunks_rendered)
-        return frames
+        # The reservoir is empty at the top of a take. Send one short burst,
+        # then settle immediately into the efficient steady batch.
+        if session.chunks_rendered == 0:
+            return min(CHUNK_FRAMES, FIRST_CHUNK_FRAMES)
+        return CHUNK_FRAMES
 
     def _next_due(self) -> Session | None:
         # round robin so no session starves when the model is at capacity
@@ -769,7 +767,7 @@ class SessionManager:
             if not self._active:
                 return IDLE_WAIT
             soonest = min(s.due_in(now, LOOKAHEAD_SECONDS) for s in self._active)
-        return max(0.002, min(IDLE_WAIT, soonest))
+        return max(0.002, min(GPU_KEEPALIVE_SECONDS, soonest))
 
     def _maybe_reap(self):
         now = time.monotonic()

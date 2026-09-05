@@ -28,14 +28,28 @@ const RINGS = 11
 const INNER = 0.52
 const OUTER = 0.96
 
-// how fast the peak-hold droplet falls back, per second
-const PEAK_FALL = 0.42
-
 // how quickly a column follows the spectrum, as time constants in seconds:
 // snaps up to a transient, settles back slowly. these are seconds rather than
 // per-frame fractions so the wave moves the same at any frame rate.
-const ATTACK = 0.028
-const RELEASE = 0.131
+const ATTACK = 0.022
+const RELEASE = 0.1
+
+// each band is read against its own recent range rather than against the raw
+// 0..255 the fft hands back, because those numbers are not a level - they are
+// a level plus whatever the track's mix, the master gain and the codec left
+// in that part of the spectrum. read raw, the top bands sit near the floor all
+// night and the bass sits near the ceiling, so the ring has one shape and only
+// breathes. read against a range that follows the band, every band gets the
+// whole radius to move in and the panel finally shows the music rather than
+// the mix. the ceiling drops slowly so a loud bar keeps its scale for a few
+// seconds; the floor rises slower still, so a band that goes quiet takes its
+// time admitting it. both are per second.
+const CEIL_FALL = 0.14
+const FLOOR_RISE = 0.05
+
+// the smallest range a band is allowed to be scaled against, so a band that
+// is doing nothing at all is not amplified into pure noise
+const MIN_RANGE = 0.1
 
 // every frame the display offers. the wave's edge crawls a fraction of a dot
 // at a time, and at thirty that crawl reads as a stutter. sampling the field
@@ -103,18 +117,30 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
     })
     sizeWatch.observe(wrap)
 
-    // one bin per spoke of the half-wave, spaced so the bass does not swallow
-    // the first three spokes and leave the rest flat
+    // the fft bins each spoke of the half-wave covers, spaced quadratically so
+    // the bass does not swallow the first three spokes and leave the rest
+    // flat. a spoke takes the mean of its whole band rather than one bin out
+    // of the sixty-odd it spans: up at the top a single bin is as likely to
+    // land in a null between partials as on the note, which is a spoke that
+    // twitches on nothing.
     const half = SPOKES / 2
     const bins = new Uint8Array(1024)
-    const binFor = new Int32Array(half)
+    const bandLo = new Int32Array(half)
+    const bandHi = new Int32Array(half)
     for (let i = 0; i < half; i++) {
-      binFor[i] = Math.round(2 + Math.pow(i / (half - 1), 2.1) * 300)
+      bandLo[i] = Math.round(2 + Math.pow(i / half, 2) * 338)
+      bandHi[i] = Math.round(2 + Math.pow((i + 1) / half, 2) * 338)
     }
 
+    // the range each band is currently being read against, and the same for
+    // the ring as a whole
+    const bandFloor = new Float32Array(half)
+    const bandCeil = new Float32Array(half)
+    bandFloor.fill(1)
+    let loudCeil = 0
+
     const amp = new Float32Array(SPOKES)
-    const peak = new Float32Array(SPOKES)
-    amp.fill(0.24)
+    const shape = new Float32Array(half)
 
     // the dot lattice, rebuilt only when the canvas changes size. deriving it
     // inside the draw loop meant a thousand-odd sin/cos pairs a frame; the
@@ -188,15 +214,42 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
 
     let raf = 0
     let last = performance.now()
-    let spin = 0
 
     const draw = (now: number, dt: number) => {
-      spin = (spin + dt * (activeRef.current ? 0.16 : 0.06)) % TAU
       const written = activeRef.current ? specRef.current(bins) : 0
 
       // one time constant per direction, not per spoke
       const rise = 1 - Math.exp(-dt / ATTACK)
       const fall = 1 - Math.exp(-dt / RELEASE)
+
+      // how far up its own range each band is sitting, and how loud the ring
+      // is against its own. shape is what the spoke draws; gain is what says
+      // whether there is any music behind it at all, so that a rest between
+      // phrases collapses the ring instead of leaving the spectrum's shape
+      // hanging there at full scale.
+      let gain = 0
+      if (written > 0) {
+        let loud = 0
+        for (let i = 0; i < half; i++) {
+          const hi = Math.max(1, Math.min(written, bandHi[i]))
+          const lo = Math.min(bandLo[i], hi - 1)
+          let sum = 0
+          for (let b = lo; b < hi; b++) sum += bins[b]
+          const lvl = sum / (hi - lo) / 255
+
+          bandCeil[i] = Math.max(lvl, bandCeil[i] - dt * CEIL_FALL)
+          bandFloor[i] = Math.min(lvl, bandFloor[i] + dt * FLOOR_RISE)
+          const n = (lvl - bandFloor[i]) / Math.max(MIN_RANGE, bandCeil[i] - bandFloor[i])
+          // a smoothstep on the way out: it pulls the quiet half of the range
+          // down towards the lip and the loud half up towards the edge, so a
+          // band crossing the middle crosses it as a lunge rather than a drift
+          shape[i] = n * n * (3 - 2 * n)
+          loud += lvl
+        }
+        loud /= half
+        loudCeil = Math.max(loud, loudCeil - dt * CEIL_FALL)
+        gain = loudCeil > 0.02 ? Math.min(1, loud / loudCeil) : 0
+      }
 
       for (let s = 0; s < SPOKES; s++) {
         // mirror the half-wave across the ring so it reads as one continuous
@@ -204,18 +257,17 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
         const i = s < half ? s : SPOKES - 1 - s
         let target: number
         if (written > 0) {
-          const b = Math.min(written - 1, binFor[i])
-          // lift the top end, which is always quieter, so the whole ring moves
-          target = 0.16 + (bins[b] / 255) * (0.7 + 0.55 * (i / half))
+          target = (0.18 + 0.82 * gain) * (0.05 + 0.95 * shape[i])
         } else {
-          // at rest, a slow swell travelling around the ring
-          target = 0.24 + 0.13 * Math.sin((s / SPOKES) * Math.PI * 4 - now / 900)
+          // at rest, a slow breath. it used to be a swell travelling round the
+          // ring, which is a spin by another name - this one is the same on
+          // every spoke, so nothing on the panel goes round.
+          target = 0.1 + 0.045 * Math.sin(now / 1300) + 0.03 * Math.sin(i * 1.7)
         }
         amp[s] += (target - amp[s]) * (target > amp[s] ? rise : fall)
-        peak[s] = Math.max(amp[s], peak[s] - PEAK_FALL * dt)
       }
 
-      buildWave(blobs, amp, peak, spin, {
+      buildWave(blobs, amp, {
         inner,
         span: inner * (OUTER / INNER - 1),
         pitch,

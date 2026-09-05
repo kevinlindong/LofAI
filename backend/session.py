@@ -1,7 +1,7 @@
 # per-user generation session
 
+import hashlib
 import os
-import math
 import threading
 import time
 
@@ -9,8 +9,6 @@ import numpy as np
 
 import engine as engine_mod
 from music_controls import MusicControls
-from melody import MelodyGuide
-import styles
 
 
 def _env_float(name: str, default: float) -> float:
@@ -27,25 +25,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# how long a slider change takes to fully land, in seconds. the stream glides
-# to the new style over this window and then sits exactly on it - this is a
-# transition between settings, not a permanent blend of two of them.
+# How long a station change takes to fully land. The stream glides to the new
+# style over this window and then sits exactly on it.
 STYLE_RAMP_SECONDS = max(
-    engine_mod.FRAME_SECONDS, _env_float("MRT_STYLE_RAMP_SECONDS", 1.2)
+    engine_mod.FRAME_SECONDS, _env_float("MRT_STYLE_RAMP_SECONDS", 0.32)
 )
 
-# the finest slice of a chunk that can carry its own style. chunks are rendered
-# a couple of seconds at a time because that is what keeps the model pipelined,
-# which would otherwise make a ramp a single step - so a ramp splits the chunk
-# instead. each extra slice costs one musiccoca tokenize call, about a
-# millisecond, and only while a transition is actually running.
-STYLE_STEP_FRAMES = max(1, _env_int("MRT_STYLE_STEP_FRAMES", 10))
-
-# Text conditioning describes a sound; the native piano-roll gives that sound
-# a coherent foreground line. Keep it on by default, with an escape hatch for
-# controlled listening comparisons.
-MELODY_GUIDE_ENABLED = _env_int("MRT_MELODY_GUIDE", 1) != 0
-
+# The finest slice of a chunk that can carry its own style. Splitting only while
+# a transition is active keeps the normal prompt path to one conditioning run.
+STYLE_STEP_FRAMES = max(1, _env_int("MRT_STYLE_STEP_FRAMES", 2))
 
 ACTIVE = "active"
 QUEUED = "queued"
@@ -62,6 +50,12 @@ def _blend(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     # then RVQ. Renormalizing the vector after mixing changes the token path
     # and is not how Magenta's interactive runtime blends prompt surfaces.
     return ((1.0 - t) * a + t * b).astype(np.float32)
+
+
+def _seed_for(session_id: str) -> int:
+    """Return the same stable 32-bit seed used by the offline composer."""
+    digest = hashlib.blake2s(session_id.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & 0xFFFFFFFF
 
 
 class Session:
@@ -85,9 +79,9 @@ class Session:
         # and what we hold onto across a pause
         self.state = None
 
-        # Planning holds this lock across boundary selection and clock/style
-        # advancement. Re-entrancy keeps the smaller public helpers usable
-        # without letting an event-loop control request split that transaction.
+        # Planning holds this lock across style advancement. Re-entrancy keeps
+        # the smaller public helpers usable without letting a WebSocket control
+        # request split that transaction.
         self._lock = threading.RLock()
         self.controls = MusicControls.initial(
             mood, instrument, station=station, payload=controls
@@ -98,10 +92,7 @@ class Session:
         self._active_prompt = self.controls.prompt()
         self._active_reference = self.controls.reference()
         self._pending_style: tuple[str, str | None] | None = None
-        self._planner_controls = self.controls
-        self._pending_planner_controls: MusicControls | None = None
-        self.melody = MelodyGuide(session_id)
-        self.seed = self.melody.seed & 0xFFFFFFFF
+        self.seed = _seed_for(session_id)
 
         # New variation invalidates a render already in flight. The worker is
         # the only thread that releases the corresponding MLX state.
@@ -135,7 +126,7 @@ class Session:
         self._active_wall = 0.0
 
         # how much audio this session has rendered so far, which is how the
-        # worker knows to start it in small chunks and grow into big ones
+        # worker knows to start it in small chunks and grow to steady state
         self.chunks_rendered = 0
 
         # Set by the websocket handler while a client is attached. The worker
@@ -169,17 +160,10 @@ class Session:
             if next_target != current_target:
                 self._pending_style = next_target
             else:
-                # Moving a style away and back before the bar cancels that
+                # Moving a style away and back before the next render cancels that
                 # queued timbre instead of landing a stale intermediate value.
                 self._pending_style = None
 
-            if next_controls != self._planner_controls:
-                # Score-affecting controls are latched as one bar transaction.
-                # Rebuilding an intensity-dependent motif or groove halfway
-                # through its phrase is as jarring as a mid-bar key change.
-                self._pending_planner_controls = next_controls
-            else:
-                self._pending_planner_controls = None
             return next_controls.payload()
 
     def control_payload(self) -> dict:
@@ -189,8 +173,7 @@ class Session:
     def request_variation(self, new_id: str) -> int:
         with self._lock:
             self.id = new_id
-            fresh = MelodyGuide(new_id)
-            self.seed = fresh.seed & 0xFFFFFFFF
+            self.seed = _seed_for(new_id)
             self._request_reset_locked()
             return self.seed
 
@@ -213,14 +196,11 @@ class Session:
         with self._lock:
             if self._reset_requested:
                 self.state = None
-                self.melody = MelodyGuide(self.id)
-                self.seed = self.melody.seed & 0xFFFFFFFF
+                self.seed = _seed_for(self.id)
                 self.generated_seconds = 0.0
                 self.chunks_rendered = 0
                 self._active_wall = 0.0
                 self._active_since = time.monotonic() if self.status == ACTIVE else None
-                self._planner_controls = self.controls
-                self._pending_planner_controls = None
                 # A new take is a genuine clean boundary.  Preserve the
                 # listener's current control values, but do not carry a stale
                 # style ramp or a previously queued station into the new model
@@ -335,52 +315,10 @@ class Session:
     def _embed_style(engine, prompt: str, reference: str | None) -> np.ndarray:
         return engine.embed(prompt, reference) if reference else engine.embed(prompt)
 
-    def _frames_to_bar(self) -> int:
-        composition = self.melody.composition
-        step_position = composition.clock.step_position
-        steps_per_bar = 16
-        position = composition.clock.position(
-            composition.active_settings.resolved_bpm
-        )
-        last_position = composition.clock.last_position
-        # A bar begins on the first model frame whose position crossed it, not
-        # throughout the entire first sixteenth note. Treating all of step zero
-        # as a boundary let changes land up to ~300ms into a bar.
-        if last_position is None or last_position.bar < position.bar:
-            return 0
-        phase = step_position % steps_per_bar
-        remaining_steps = steps_per_bar - phase
-        bpm = composition.active_settings.resolved_bpm
-        return max(
-            1,
-            math.ceil(
-                remaining_steps
-                * engine_mod.FRAMES_PER_SECOND
-                * 60.0
-                / (bpm * 4.0)
-            ),
-        )
-
-    def control_boundary_frames(self, maximum: int) -> int:
-        """Shorten a render so a queued style/score change starts next bar."""
-        with self._lock:
-            pending = (
-                self._pending_style is not None
-                or self._pending_planner_controls is not None
-            )
-        if not pending or self._current is None:
-            return maximum
-        boundary = self._frames_to_bar()
-        return boundary if 0 < boundary < maximum else maximum
-
     def _activate_pending_style(self, engine):
         with self._lock:
             pending = self._pending_style
             self._pending_style = None
-            pending_controls = self._pending_planner_controls
-            self._pending_planner_controls = None
-            if pending_controls is not None:
-                self._planner_controls = pending_controls
 
         if pending is not None:
             prompt, reference = pending
@@ -436,35 +374,11 @@ class Session:
         return plan
 
     def style_plan(self, engine, frames: int) -> list[tuple[np.ndarray, str | None, int]]:
-        """Return style runs, landing requested changes on a bar boundary."""
+        """Return prompt-style runs, applying changes on the next model chunk."""
         if frames <= 0:
             return []
-        with self._lock:
-            has_pending = (
-                self._pending_style is not None
-                or self._pending_planner_controls is not None
-            )
-
-        # The initial station has no previous music to preserve. Subsequent
-        # changes wait for the shared composition clock's next bar, avoiding a
-        # mid-phrase RVQ jump. The short embedding ramp then starts there.
-        if has_pending and self._current is not None:
-            wait = self._frames_to_bar()
-            if wait > 0:
-                return self._style_segments(engine, frames)
-            self._activate_pending_style(engine)
-            return self._style_segments(engine, frames)
-
         self._activate_pending_style(engine)
         return self._style_segments(engine, frames)
-
-    def prepare_conditioning(
-        self, engine, maximum: int
-    ) -> tuple[int, list[engine_mod.ConditioningRun]]:
-        """Choose the next musical boundary and advance its plan atomically."""
-        with self._lock:
-            frames = self.control_boundary_frames(maximum)
-            return frames, self._conditioning_plan(engine, frames)
 
     def conditioning_plan(
         self, engine, frames: int
@@ -475,77 +389,33 @@ class Session:
     def _conditioning_plan(
         self, engine, frames: int
     ) -> list[engine_mod.ConditioningRun]:
-        """Combine the style surface with one coordinated musical score.
-
-        Harmony, melody, drums, tempo, and form come from one planner. Style
-        and score changes retain independent boundaries; splitting only at a
-        boundary keeps the per-frame conditioning cache effective.
-        """
+        """Build the minimal conditioning MRT2 needs for live generation."""
         if frames <= 0:
             return []
         style_runs = self.style_plan(engine, frames)
         with self._lock:
-            controls = self._planner_controls
-
-        self.melody.configure(
-            station=controls.station,
-            mood=controls.mood,
-            bpm=controls.bpm,
-            groove=controls.groove,
-            intensity=controls.intensity,
-            melody_enabled=controls.melody and MELODY_GUIDE_ENABLED,
-            drums_enabled=controls.drums,
-            guide_mode="guided" if MELODY_GUIDE_ENABLED else "unconstrained",
-        )
-        note_runs = self.melody.plan_events(controls.mood, frames)
-        sampling = self._sampling_for(engine, controls)
-
-        combined: list[engine_mod.ConditioningRun] = []
-        style_index = note_index = 0
-        style_left = style_runs[0][2]
-        note_left = note_runs[0][1]
-        while style_index < len(style_runs) and note_index < len(note_runs):
-            style, key, _ = style_runs[style_index]
-            event, _ = note_runs[note_index]
-            take = min(style_left, note_left)
-            combined.append(
-                engine_mod.ConditioningRun(
-                    style=style,
-                    key=key,
-                    notes=event,
-                    drum=event.drum,
-                    frames=take,
-                    sampling=sampling,
-                )
+            controls = self.controls
+        sampling = self._sampling_for(engine)
+        drum = None if controls.drums else 0
+        return [
+            engine_mod.ConditioningRun(
+                style=style,
+                key=key,
+                notes=None,
+                drum=drum,
+                frames=run_frames,
+                sampling=sampling,
             )
-            style_left -= take
-            note_left -= take
-
-            if style_left == 0:
-                style_index += 1
-                if style_index < len(style_runs):
-                    style_left = style_runs[style_index][2]
-            if note_left == 0:
-                note_index += 1
-                if note_index < len(note_runs):
-                    note_left = note_runs[note_index][1]
-
-        if sum(run.frames for run in combined) != frames:
-            raise RuntimeError("conditioning plan lost frames")
-        return combined
+            for style, key, run_frames in style_runs
+        ]
 
     @staticmethod
-    def _sampling_for(engine, controls: MusicControls) -> engine_mod.SamplingControls:
-        base = (
+    def _sampling_for(engine) -> engine_mod.SamplingControls:
+        return (
             engine.default_sampling()
             if hasattr(engine, "default_sampling")
-            else engine_mod.SamplingControls(1.1, 50, 1.6, 2.4, 4.0)
+            else engine_mod.SamplingControls(1.0, 100, 3.0, 5.0, 1.0)
         )
-        # Energy belongs to the score: note density, voicing size, register,
-        # bass motion, and comping rhythm. Raising temperature/top-k at the
-        # same time made the energetic end less coherent, while the tiny drum
-        # CFG adjustment rounded back to the same discrete MRT token anyway.
-        return base
 
     def _ramp_at(self, elapsed: float) -> tuple[np.ndarray, str | None]:
         t = min(1.0, elapsed / STYLE_RAMP_SECONDS)

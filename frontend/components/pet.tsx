@@ -60,11 +60,18 @@ const MIN_FRAME_MS = 0
 
 // how the head follows the beat, as time constants in seconds: drops fast,
 // comes back up slowly. seconds rather than per-frame fractions so the bob
-// feels the same however often we draw. the attack is a shade slower than it
-// wants to be on paper - the head moves in whole dots, so an attack quick
-// enough to catch every transient just makes it flicker between two rows.
-const BOB_ATTACK = 0.055
+// feels the same however often we draw. the attack was slowed down for a
+// while, back when the beat was rounded to whole dots and only ever put the
+// cat in one of two poses - catching every transient just flickered it between
+// them. the lift is continuous again, so the landing can be sharp again.
+const BOB_ATTACK = 0.033
 const BOB_RELEASE = 0.27
+
+// how long the cat takes to settle into the music, and to settle out of it
+// again. the bop rides the loaf up off the ground between beats, so this is
+// the difference between a cat finding the groove and a cat teleporting a dot
+// upwards the instant the first note arrives.
+const GROOVE_FOLLOW = 0.45
 
 // how fast the eyes catch up with the cursor. slow enough to be a head turning
 // rather than a cursor with whiskers, fast enough not to feel broken.
@@ -210,6 +217,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
 
     let raf = 0
     let smoothed = 0
+    let groove = 0
     let gazeX = 0
     let gazeY = 0
     let affection = 0
@@ -231,6 +239,8 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
       smoothed +=
         (level - smoothed) *
         (1 - Math.exp(-dt / (level > smoothed ? BOB_ATTACK : BOB_RELEASE)))
+      const wants = playingRef.current ? 1 : 0
+      groove += (wants - groove) * (1 - Math.exp(-dt / GROOVE_FOLLOW))
 
       // ---- where the cat is looking ----
       const rect = canvas.getBoundingClientRect()
@@ -338,6 +348,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         pat,
         phase: now / 1000,
         notes: playingRef.current,
+        groove,
         sparkle,
         gazeX,
         gazeY,

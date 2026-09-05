@@ -26,7 +26,7 @@ class PcmProcessor extends AudioWorkletProcessor {
     this.srcRate = opts.sourceRate || sampleRate
     this.baseStep = this.srcRate / sampleRate
 
-    this.capacity = Math.max(8192, Math.round((opts.ringSeconds || 45) * this.srcRate))
+    this.capacity = Math.max(8192, Math.round((opts.ringSeconds || 8) * this.srcRate))
     // PCM arrives as int16. Keeping that representation removes a full-buffer
     // conversion on the UI thread and halves the ring's memory footprint.
     this.ring = new Int16Array(this.capacity * this.channels)
@@ -36,10 +36,10 @@ class PcmProcessor extends AudioWorkletProcessor {
     this.written = 0
     this.readPos = 0
 
-    this.prebuffer = Math.round((opts.prebufferSeconds ?? 2) * this.srcRate)
-    this.rebuffer = Math.round((opts.rebufferSeconds ?? 2) * this.srcRate)
-    this.comfort = Math.round((opts.comfortSeconds ?? 4) * this.srcRate)
-    this.minRate = opts.minRate ?? 0.97
+    this.prebuffer = Math.round((opts.prebufferSeconds ?? 0.8) * this.srcRate)
+    this.rebuffer = Math.round((opts.rebufferSeconds ?? 0.8) * this.srcRate)
+    this.comfort = Math.round((opts.comfortSeconds ?? 1.6) * this.srcRate)
+    this.minRate = opts.minRate ?? 1
     this.need = this.prebuffer
 
     this.playing = false

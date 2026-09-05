@@ -1,6 +1,6 @@
 # LofAI
 
-An AI generated lofi music player. Every listener gets their own endless stream, generated live, and steering the mood or instrument bends the music as it plays.
+An AI generated lofi music player. Every listener gets their own endless stream, generated live, and switching stations bends the music as it plays.
 
 ## Screenshot:
 
@@ -8,14 +8,15 @@ An AI generated lofi music player. Every listener gets their own endless stream,
 
 ## How it Works:
 
-- Google DeepMind's Magenta RealTime 2 (`mrt2_small`) is the live performer and renderer. It produces continuous 48kHz stereo audio while keeping a separate recurrent state for every listener
-- A deterministic 32-bar composition planner supplies the musical intent MRT2 does not create reliably from a short streaming context: shared tempo, key, close-voiced harmony, articulated bass/comping, chord-aware motifs, and real A/B/reprise form
-- Notes use MRT2's exact piano-roll event vocabulary (masked, release, sustain, onset). This gives the model a playable score while leaving unassigned pitches free for arrangement and texture
-- Four curated stations combine concise MusicCoCa prompts, musical defaults, and optional reference audio. Style/harmony changes land on bar boundaries; tempo, groove, intensity, music-guide, and drum controls share the same score clock
-- **New take** resets the recurrent model state and composition seed together, then prevents old in-flight audio from leaking into the new variation
+- Google DeepMind's Magenta RealTime 2 (`mrt2_small`) is the live performer and renderer. Every 40ms it samples SpectroStream tokens, decodes 48kHz stereo audio, and carries a separate recurrent state for each listener
+- The live path is prompt-first: one concise MusicCoCa station embedding guides MRT2 while its own audio history supplies the musical continuity. Piano-roll generation, bar clocks, and per-frame score churn stay out of the hot loop
+- Four curated stations provide coherent style targets. The only musical override is drums on/off; station changes start on the next model chunk and glide over 320ms
+- **New take** resets the recurrent model state and sampling seed together, then prevents old in-flight audio from leaking into the new variation
 - Raw PCM travels over a WebSocket into one AudioWorklet read cursor. A slow loudness normalizer, transparent limiter, and output ceiling make station changes consistent without pumping or clipping
-- The backend measures render speed and selects the highest codec depth that can stay ahead of playback. Paused sessions remain warm and resume from the same musical state
-- An offline evaluation harness renders matched, fixed-seed comparisons and creates blind listening tests. Signal metrics catch broken audio; people decide whether the result is good music
+- Four-bit weights, GPU keepalive, short startup chunks, and adaptive 10-12 layer codec output keep the M1 Air ahead of playback. The browser starts from a sub-second reservoir instead of hiding deficits behind seconds of buffering
+- The old symbolic composer remains available only to the offline evaluation harness for matched, fixed-seed comparisons. Signal metrics catch broken audio; people decide whether the result is good music
+
+See [the streaming design note](docs/MUSIC_STREAMING.md) for the full MRT2 pipeline, bottleneck analysis, and local benchmarks.
 
 ## Languages and Frameworks:
 
@@ -60,7 +61,7 @@ mrt models init                      # MusicCoCa + SpectroStream
 mrt checkpoints download mrt2_small  # the streaming model
 ```
 
-`./start-backend.sh` does both of these for you if you skip this step. Assets land in `~/Documents/Magenta`; set `MAGENTA_HOME` to put them elsewhere.
+`./backend_start.sh` does both of these for you if you skip this step. Assets land in `~/Documents/Magenta`; set `MAGENTA_HOME` to put them elsewhere.
 
 ## Run:
 
@@ -69,8 +70,8 @@ mrt checkpoints download mrt2_small  # the streaming model
 ./start.sh
 
 # Option 2: Run separately
-./start-backend.sh  # Terminal 1
-./start-frontend.sh # Terminal 2
+./backend_start.sh  # Terminal 1
+./frontend_start.sh # Terminal 2
 ```
 
 `./start.sh` is the foreground supervisor for the complete application. Leave
@@ -80,7 +81,7 @@ follower together. If you choose the two-terminal option, Ctrl+C each of those
 foreground commands when you are done.
 
 The frontend launcher serves a production build by default. For Next.js hot
-reload while developing, run `LOFAI_FRONTEND_MODE=development ./start-frontend.sh`.
+reload while developing, run `LOFAI_FRONTEND_MODE=development ./frontend_start.sh`.
 
 Backend: http://localhost:8000
 Frontend: http://localhost:3000
@@ -90,8 +91,11 @@ The backend binds to loopback by default. To listen from another device, set
 add the frontend origin to the comma-separated `LOFAI_ALLOWED_ORIGINS`. Keep
 the default loopback binding unless LAN access is intentional.
 
-The model loads in a few seconds and then spends another 5-15s embedding the style prompts; the play button reports "warming up the model" until both are done.
-Mapped MusicCoCa embeddings are cached under `~/Library/Caches/lofai/embeddings`, so later starts skip that text-encoder work. Set `MRT_EMBEDDING_CACHE=` to disable the cache or point it elsewhere.
+The HTTP server starts immediately while the model loads, checks decoded audio,
+and calibrates itself; the play button reports "warming up the model" until it
+is ready. Mapped MusicCoCa embeddings are cached under
+`~/Library/Caches/lofai/embeddings`, so later starts skip the text-encoder work.
+Set `MRT_EMBEDDING_CACHE=` to disable the cache or point it elsewhere.
 
 ## Tuning:
 
@@ -103,27 +107,27 @@ The backend runs every session on one thread, so how many people can listen at o
 | `MRT_MAX_SESSIONS` | `1` | Concurrent streams. Extra listeners queue for a slot |
 | `LOFAI_BACKEND_HOST` | `127.0.0.1` | Backend bind address; use `0.0.0.0` only for intentional LAN access |
 | `LOFAI_ALLOWED_ORIGINS` | local frontend origins | Comma-separated browser origins allowed to open the music WebSocket |
-| `MRT_TARGET_RTF` | `1.15` | How much faster than real time the auto-tuner aims to render. Raising it buys margin by spending audio detail |
-| `MRT_TEMPERATURE` | `1.1` | Sampling randomness. This matches the upstream interactive baseline; tune with listening tests |
-| `MRT_TOP_K` | `50` | Candidate token pool. This matches the upstream interactive baseline |
-| `MRT_CFG_MUSICCOCA` | `1.6` | MusicCoCa style guidance strength |
-| `MRT_CFG_NOTES` | `2.4` | Piano-roll score guidance strength |
-| `MRT_CFG_DRUMS` | `4.0` | Drum-roll guidance strength |
-| `MRT_MELODY_GUIDE` | `1` | Enables the composed music guide: bass, comping, harmony, and melody |
+| `MRT_TARGET_RTF` | `1.18` | How much faster than real time the auto-tuner aims to render. Raising it buys margin by spending audio detail |
+| `MRT_TEMPERATURE` | `1.0` | Sampling randomness; matches the upstream native live runner |
+| `MRT_TOP_K` | `100` | Candidate token pool; matches the upstream native live runner |
+| `MRT_CFG_MUSICCOCA` | `3.0` | MusicCoCa style guidance strength |
+| `MRT_CFG_NOTES` | `5.0` | Upstream-compatible MIDI guidance strength; live generation sends no MIDI |
+| `MRT_CFG_DRUMS` | `1.0` | Drum guidance strength |
 | `MRT_STYLE_TOKEN_LEVELS` | `6` | Coarse MusicCoCa RVQ levels retained; the fine tail is masked for stable live steering |
 | `MRT_EMBEDDING_CACHE` | `~/Library/Caches/lofai/embeddings` | Persistent mapped-style cache, removing several seconds from later startups |
 | `MRT_STYLE_REFERENCE_DIR` | unset | Optional directory of station WAV files named `<station>.wav` |
 | `MRT_AUDIO_STYLE_BLEND` | `0.75` | Weight of reference-audio style versus its station text prompt |
-| `MRT_CONDITIONING_CACHE_SIZE` | `2048` | Maximum cached score/style conditioning bundles |
+| `MRT_CONDITIONING_CACHE_SIZE` | `128` | Maximum cached style/drum conditioning bundles |
 | `MRT_CODEBOOKS` | auto | Pins the codebook count and turns the auto-tuner off |
 | `MRT_MIN_CODEBOOKS` | `10` | Listener-facing codec quality floor (accepted range 8-12; lowering it is an explicit quality tradeoff) |
-| `MRT_BITS` | `8` | Weight quantisation: `8`, `4`, or `0` for full precision. `4` renders about 10% faster and roughly halves model memory |
+| `MRT_BITS` | `4` | Weight quantisation: `8`, `4`, or `0` for full precision. Four-bit is the measured live default on an 8GB M1 |
 | `MRT_MLX_CACHE_MB` | `384` | Limit for reusable MLX buffers after calibration; prevents cache pressure and swap jitter on 8GB Macs |
 | `MRT_FAST_SAMPLER` | `1` | Slice each codebook's valid logits before top-k sampling. Set `0` to use Magenta's generic sampler |
-| `MRT_CHUNK_FRAMES` | `25` | Frames generated per model call (25 frames = 1s). Larger saves a little pipeline overhead but delays controls and transport |
-| `MRT_LOOKAHEAD_SECONDS` | `2.0` | How far ahead of the wall clock to generate. This is the listener's reservoir; lower means slider changes land sooner, but leaves less cushion |
-| `MRT_STYLE_RAMP_SECONDS` | `1.2` | How long a slider change takes to fully land |
-| `MRT_STYLE_STEP_FRAMES` | `10` | How finely a chunk is split while a slider change is gliding |
+| `MRT_CHUNK_FRAMES` | `10` | Steady frames per model call (400ms). Larger saves a little pipeline overhead but delays controls and transport |
+| `MRT_FIRST_CHUNK_FRAMES` | `8` | First burst size (320ms), followed by the steady chunk size |
+| `MRT_LOOKAHEAD_SECONDS` | `0.4` | Server-side generated lead; lower makes station changes land sooner but leaves less scheduling cushion |
+| `MRT_STYLE_RAMP_SECONDS` | `0.32` | How long a station change takes to fully land |
+| `MRT_STYLE_STEP_FRAMES` | `2` | How finely a chunk is split while a station change is gliding |
 | `MRT_SESSION_TTL` | `300` | How long a paused session keeps its state |
 | `MRT_BACKEND` | `python` | Runs the checkpoint eagerly. `mlxfn` currently falls back to `python` because its output/seed path is not safe |
 
@@ -131,15 +135,15 @@ The backend runs every session on one thread, so how many people can listen at o
 
 ## Musical quality and real time:
 
-MRT2 has a short live context and is best treated as a responsive performer, not a complete song composer. lofAI therefore owns the slower musical structure. Its 32-bar form moves through intro, A, B, breakdown, and a genuine return to A. Mid-register chord inversions move by short distances; bass and comping breathe between hits instead of droning for whole bars; strong melody notes target the current chord while short passing tones remain free. Groove delays offbeats by bounded sub-step amounts, and intensity changes arrangement density rather than making the sampler more random.
+MRT2 is best treated as a responsive performer, not as a conventional prompt-to-finished-song service. The live stream now lets the model continue its own recurrent audio state instead of forcing a synthetic score into every frame. That removes a large control surface, makes the implementation easier to reason about, and sounded less rigid in local comparison. The former 32-bar composer is still available for controlled offline experiments, where latency is irrelevant and its musical value can be judged honestly.
 
 Style prompts are deliberately short and concrete. A long list of genre, production, mood, and instrumentation adjectives can dilute MusicCoCa conditioning rather than improve it. A station may also have a reference WAV, which is embedded through the same native MusicCoCa path and blended with its text identity. The drum channel follows MRT2's supported on/off use: enabled leaves the model free to create a style-appropriate beat, while disabled explicitly requests drumless audio; a strict 1/0 pulse remains available only in the evaluation harness.
 
-MRT2 samples one 40ms frame and up to 12 residual audio-codec layers at a time. More layers improve fidelity but cost time and also affect later recurrent state. Production defaults to adaptive 10–12-layer rendering and refuses to hide a sustained render deficit behind a larger buffer: each active session must remain above a `realtimeFactor` of 1.0. The higher-quality evaluation path pins all 12 layers and can run slower than real time.
+MRT2 samples one 40ms frame and up to 12 residual audio-codec layers at a time. More layers improve fidelity but cost time and also affect later recurrent state. Production defaults to four-bit weights and adaptive 10–12-layer rendering, targeting 1.18x real time. It refuses to hide a sustained render deficit behind a larger buffer: each active session must remain above a `realtimeFactor` of 1.0. The higher-quality evaluation path pins all 12 layers and can run slower than real time.
 
 The eager MLX path pipelines frame evaluation and samples only the valid logits for each codebook. Post-calibration cache limits prevent MLX reusable buffers from crowding an 8GB machine into swap. The exported `mlxfn` backend remains disabled by default because locally exported and published graphs have produced invalid/noise-like decoding with the supported MLX versions.
 
-Playback uses a single AudioWorklet cursor, so model chunks do not become browser scheduling seams. The browser starts only after prebuffering, adapts reservoir size to measured generation speed, and keeps playback at 1.0x. Mastering changes gain slowly and catches only peaks, which avoids turning every kick into audible gain pumping.
+Playback uses a single AudioWorklet cursor, so model chunks do not become browser scheduling seams. The browser starts after roughly 0.64-0.9 seconds when measured generation is healthy, uses a bounded eight-second ring, and keeps playback at 1.0x. Mastering changes gain slowly and catches only peaks, which avoids turning every kick into audible gain pumping.
 
 Startup signal checks detect silence, clipping, corruption, DC, and obvious noise-like failure. They are guardrails, not musical-quality scores. Test candidate settings with the listening workflow below before changing production defaults.
 

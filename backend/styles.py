@@ -42,7 +42,7 @@ STATIONS: dict[str, Station] = {
     "dusty-beats": Station(
         "dusty-beats",
         "Dusty Beats",
-        "dusty lo-fi hip hop beat, warm vinyl, mellow jazz guitar",
+        "instrumental mellow lo-fi hip hop, dusty drums, warm jazz guitar, vinyl",
         "neutral",
         "guitar",
         76,
@@ -52,7 +52,7 @@ STATIONS: dict[str, Station] = {
     "rainy-piano": Station(
         "rainy-piano",
         "Rainy Piano",
-        "intimate felt piano, rainy ambient lo-fi, soft tape warmth",
+        "instrumental ambient lo-fi, intimate felt piano, sparse brushed drums, soft tape warmth",
         "somber",
         "piano",
         68,
@@ -62,7 +62,7 @@ STATIONS: dict[str, Station] = {
     "jazz-cafe": Station(
         "jazz-cafe",
         "Jazz Cafe",
-        "mellow jazz trio, brushed groove, warm clean guitar",
+        "instrumental late-night jazzhop trio, warm clean guitar, upright bass, brushed drums",
         "neutral",
         "guitar",
         82,
@@ -72,7 +72,7 @@ STATIONS: dict[str, Station] = {
     "sunlit-groove": Station(
         "sunlit-groove",
         "Sunlit Groove",
-        "bright soulful lo-fi groove, muted brass, crisp relaxed beat",
+        "instrumental soulful jazzhop, muted trumpet, Rhodes keys, crisp relaxed drums",
         "lively",
         "brass",
         94,
@@ -140,9 +140,9 @@ def audio_reference_for(station: str | None) -> str | None:
 
 
 def all_prompts() -> list[str]:
-    return [station.prompt for station in STATIONS.values()] + list(
-        CUSTOM_PROMPTS.values()
-    )
+    # Only listener-facing stations belong on the startup path. Legacy custom
+    # combinations are embedded lazily if an older client requests one.
+    return [station.prompt for station in STATIONS.values()]
 
 
 def reference_map() -> dict[str, str]:

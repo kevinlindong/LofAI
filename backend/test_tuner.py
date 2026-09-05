@@ -88,6 +88,15 @@ with patch.object(E.time, "monotonic", return_value=107.0):
     e.note_pressure()
 check("normal startup sawtooth keeps measured headroom", e.codebooks == 12)
 
+# Retuning clears old-depth samples, but the UI must not briefly see 0x speed.
+e = fresh(); e._seed_cost(0.040 / 1.19)
+e._clear_costs()
+check(
+    "quality changes retain the last displayed speed",
+    abs(e.realtime_factor() - 1.19) < 1e-9 and not e.throughput_ready(),
+    f"now {e.realtime_factor():.2f}x",
+)
+
 # An explicit lower floor remains possible for controlled quality comparisons.
 e = fresh(); e.min_codebooks = E.ABSOLUTE_MIN_CODEBOOKS
 for _ in range(20): e.note_gap()
@@ -176,8 +185,13 @@ sty.style_plan(fake, 1)
 sty.request_style("neutral", "piano")
 plan = sty.style_plan(fake, 25)
 values = [float(style[0]) for style, _key, _frames in plan]
-check("style ramp uses segment midpoints", values[0] < 0.1 and abs(values[1] - 0.5) < 1e-6,
-      f"values {values}")
+check(
+    "style ramp uses segment midpoints",
+    0.0 < values[0] < values[-2] < values[-1]
+    and abs(values[-1] - 1.0) < 1e-6
+    and values == sorted(values),
+    f"values {values}",
+)
 check("style plan preserves frame count", sum(frames for _s, _k, frames in plan) == 25)
 
 print(f"\n{sum(ok)}/{len(ok)} passed")
