@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { MetaballField } from "@/components/metaball-field"
+import { AsciiAmbience } from "@/components/ascii-ambience"
 import { MusicControls } from "@/components/music-controls"
 import { Pet, type PetEvent, type PetSignal } from "@/components/pet"
 import { PomodoroTimer } from "@/components/pomodoro-timer"
@@ -133,7 +133,7 @@ export default function LofiGenerator() {
 
   return (
     <main className="site-shell">
-      <MetaballField getLevel={getLevel} playing={isLive} />
+      <AsciiAmbience />
 
       <div className="app-frame">
         <header className="app-header">

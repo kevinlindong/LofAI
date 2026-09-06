@@ -80,17 +80,25 @@ const RING_SECONDS = 8
 const FATAL_SERVER_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1011])
 const SESSION_MAX_AGE_MS = 4 * 60 * 1000
 
-// The model's PCM is deliberately conservative (typically around -26 dBFS
-// RMS). Lift it slowly, then catch only the occasional peak. A one-second
-// meter and rate-limited gain movement keep the normalizer from following the
-// beat and turning into an audible compressor.
+// The model's PCM is deliberately conservative: its int16 stage applies a
+// fixed 0.5 gain (about -6 dB) for headroom, so program RMS lands around
+// -21 to -26 dBFS. That known constant is undone by a fixed makeup stage.
+// The adaptive part is only a small station-leveling trim around it, and it
+// moves on a scale of minutes. An earlier version instead adapted over a
+// +9 dB range fast enough to follow musical dynamics: every mellow passage
+// ratcheted the gain up, which lifted the codec/model noise floor with it,
+// and listeners heard a session that slowly developed background hiss. The
+// music's quiet moments are dynamics to preserve, not miscalibration to
+// correct, and the noise floor must never depend on how quiet the last few
+// phrases were.
 const LOUDNESS_TARGET_DBFS = -18
+const MAKEUP_GAIN_DB = 5
 const NORMALIZER_MIN_DB = -3
-const NORMALIZER_MAX_DB = 9
-const NORMALIZER_STEP_UP_DB = 0.35
+const NORMALIZER_MAX_DB = 3
+const NORMALIZER_STEP_UP_DB = 0.2
 const NORMALIZER_STEP_DOWN_DB = 0.75
 const LOUDNESS_POLL_MS = 1000
-const LOUDNESS_SMOOTHING = 0.08
+const LOUDNESS_SMOOTHING = 0.03
 const MIN_NORMALIZE_POWER = 10 ** (-48 / 10)
 
 class SinkBuildCancelled extends Error {}
@@ -696,7 +704,9 @@ export class MrtStream {
     inputMeter.smoothingTimeConstant = 0
 
     const normalizer = ctx.createGain()
-    normalizer.gain.value = 1
+    // The fixed makeup applies immediately: restoring the codec's known -6 dB
+    // headroom is not something to converge toward over a minute.
+    normalizer.gain.value = dbToGain(MAKEUP_GAIN_DB)
 
     const limiter = ctx.createDynamicsCompressor()
     limiter.threshold.value = -2.5
@@ -777,8 +787,10 @@ export class MrtStream {
         : this.smoothedPower * (1 - LOUDNESS_SMOOTHING) + power * LOUDNESS_SMOOTHING
 
     const measuredDb = 10 * Math.log10(this.smoothedPower)
+    // normalizerDb is the small trim around the fixed makeup, not the whole
+    // gain. Its bounds are what bound how far the noise floor can ever rise.
     const wantedDb = clamp(
-      LOUDNESS_TARGET_DBFS - measuredDb,
+      LOUDNESS_TARGET_DBFS - MAKEUP_GAIN_DB - measuredDb,
       NORMALIZER_MIN_DB,
       NORMALIZER_MAX_DB,
     )
@@ -790,7 +802,11 @@ export class MrtStream {
     if (Math.abs(delta) < 0.01) return
 
     this.normalizerDb += delta
-    normalizer.gain.setTargetAtTime(dbToGain(this.normalizerDb), ctx.currentTime, 3)
+    normalizer.gain.setTargetAtTime(
+      dbToGain(MAKEUP_GAIN_DB + this.normalizerDb),
+      ctx.currentTime,
+      3,
+    )
   }
 
   private ensureSink(): Promise<PcmSink> {

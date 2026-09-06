@@ -58,12 +58,20 @@ There is one loaded model and one MLX-owning worker thread. Each listener keeps
 only its own recurrent model state, prompt transition, transport clock, and
 seed. The normal live conditioning is:
 
-- six coarse MusicCoCa style tokens from one curated station prompt;
+- all twelve MusicCoCa style tokens from one curated station prompt. Neither
+  checkpoint was trained with style-token masking (`mask_musiccoca=False`),
+  so masking the fine half at inference conditions the model outside its
+  training distribution; the earlier six-token mask audibly weakened style
+  adherence and is now an explicit experiment behind
+  `MRT_STYLE_TOKEN_LEVELS`;
 - no piano-roll tokens, so MRT2 performs and continues its own music;
 - no drum condition when drums are enabled, or an explicit off token when they
   are disabled;
-- the official native runner's sampling defaults: temperature 1.0, top-k 100,
-  MusicCoCa CFG 3, notes CFG 5, drums CFG 1.
+- sampling: temperature 1.0, top-k 100, MusicCoCa CFG 3, drums CFG 1, and
+  notes CFG 1 (the library default). The earlier notes CFG of 5 told the
+  model, every frame, to strongly follow a fully masked score - a token
+  combination it never saw in training, since the notes CFG token co-varied
+  with real piano-roll data. Raise it only when actually supplying notes.
 
 The older 32-bar symbolic composer remains in `composition.py` and `melody.py`
 for offline, fixed-seed listening comparisons. It is not part of `Session` or
@@ -79,7 +87,9 @@ the real-time hot loop.
 | `backend/server.py` | Validate messages and bridge PCM through a bounded per-socket outbox |
 | `backend/session_manager.py` | Admit one live listener on this machine, pace chunks, and own the sole model thread |
 | `backend/session.py` | Hold one recurrent state/seed and turn station changes into short style ramps |
+| `backend/take_health.py` | Watch each take's quiet-moment floor and detect a self-amplifying hiss bed; provide the crossfade splice |
 | `backend/engine.py` | Load MRT2, cache conditioning, render frames, measure speed, and tune codec depth |
+| `backend/fast_engine.py` | Specialize the pinned magenta-rt streaming step: sliced logits, cached conditioning encoding, hoisted constants, clean RVQ truncation |
 | `backend/styles.py` | Define the four listener-facing MusicCoCa prompts and optional audio references |
 
 `composition.py`, `melody.py`, and `backend/evaluation/` are deliberately
@@ -128,11 +138,116 @@ wall-clock second; it must remain above 1.0 indefinitely.
 | 4-bit, 10 codec layers | 33.1 | 1.21x |
 
 Four-bit weights also reduced model load from roughly 13.4 to 6.1-6.5 seconds
-in repeated local runs. The live default is therefore 4-bit, while codec depth
-remains adaptive from 12 down to a quality floor of 10. Calibration targets
-1.18x, usually selecting 10 or 11 layers on this machine. Listening quality is
-subjective, so the evaluation path still supports controlled 8-bit/12-layer
-A/B renders when deciding whether that speed-for-detail trade is worthwhile.
+in repeated local runs. Four-bit was originally chosen as the live default on
+those numbers alone. It was later reverted to 8-bit: `nn.quantize` was
+quantizing the *entire* sampler with round-to-nearest 4-bit weights -
+including the SpectroStream codec decoder that turns tokens into waveforms
+and every embedding table - and that was audibly the largest quality cost in
+the pipeline. The specialized step loop below buys back more time than the
+4-bit/8-bit gap, so the speed argument for 4-bit no longer holds. When
+`MRT_BITS=4` is explicitly requested for memory, the codec decoder now stays
+at 8-bit: degraded token prediction is a taste choice, a degraded codec is
+just noise. Codec depth remains adaptive from 12 down to a quality floor of
+10, and calibration targets 1.18x.
+
+## The specialized streaming step
+
+Profiling the per-frame step on an M3 Pro (barriered, so relative numbers
+only) attributed roughly 14 of 24 ms to the depth loop: 10-12 sequential
+two-layer transformer steps, each ending in a `to_logits` projection of its
+768-dim hidden state onto the full 12,294-token vocabulary, of which exactly
+1,024 logits are valid for that codebook. `backend/fast_engine.py` replaces
+the pinned library step (per instance, guarded by version and structure
+checks, with per-call fallback to stock) with one that:
+
+- projects each depth step against only its codebook's 1,024 weight rows,
+  reading 12x less `to_logits` weight data per step. Metal tiles the smaller
+  matmul differently, so logits may differ from stock in the final bf16
+  mantissa bit; install-time verification requires agreement within one ulp
+  and disables slicing otherwise. Takes can therefore diverge from the stock
+  trajectory over time, the same documented trade the fast sampler already
+  makes with its RNG stream;
+- computes the conditioning encoder once per conditioning block instead of
+  every frame (the encoder is stateless in this configuration, so this is
+  exactly equal);
+- hoists the depth transformer's initial state, the skipped-codebook dummy
+  tokens, and the CFG/delay bookkeeping the live path never uses out of the
+  per-frame loop (exactly equal).
+
+It also fixes what quality truncation actually decodes. Upstream pads
+skipped codebooks with code 0 and the RVQ decode then adds that codebook's
+row-0 *centroid* - a full-magnitude learned vector, not silence - into every
+frame (measured `|q10[0]| = 6.24` against a codebook mean of `6.23`). At 10
+active layers that contaminated every frame of audio with two arbitrary
+residual vectors, which is a large part of why reduced depth sounded broken
+rather than merely duller. The decode now slices the token frame to the
+active count, making truncation mean truncation. At 12 active layers both
+paths are identical.
+
+Measured on an M3 Pro at 12 codec layers, 10-frame chunks, in the pipelined
+engine loop (medians over 250 frames): 8-bit stock+fast-sampler 20.1
+ms/frame (1.99x) against 19.0 ms/frame (2.11x) with the fast engine, and the
+same take stayed bit-identical end to end. At 10 active layers the gap was
+19.6 against 18.0 ms/frame, where output intentionally differs because the
+code-0 contamination is gone. The absolute win is larger on
+bandwidth-constrained machines like the target M1 Air, where the full
+`to_logits` read alone costs roughly 1.9 ms per frame at 8 bits versus
+roughly 0.16 ms sliced.
+
+## Long takes: the rising noise floor
+
+Two separate mechanisms made long sessions grow an audible hiss bed, one on
+each side of the WebSocket, and they compounded.
+
+**The model amplifies its own floor.** MRT2's only continuity is the audio
+it just generated. On sparse stations that feedback has a failure
+attractor: once a bright sustained texture enters the ~20-second context,
+the model tends to continue and reinforce it. Rendered 12-minute takes,
+measured on the level of the quietest 50 ms blocks (the gaps between notes,
+where a bed is exposed) against the same take's first minute:
+
+| Station | quiet-gap floor early | worst trailing minute | high band (5-14 kHz) |
+|---|---:|---:|---:|
+| rainy-piano | -42.7 dBFS | +9.9 dB | +28 dB |
+| dusty-beats (12 min) | -45.3 dBFS | +19.4 dB | +23 dB |
+| jazz-cafe | -37.8 dBFS | +6.6 dB, receded | +12 dB, receded |
+
+The first two are runaways: the floor climbs for minutes and does not come
+back. The jazz excursion is what a healthy arrangement getting brighter for
+half a minute looks like, and it recovers on its own.
+
+`backend/take_health.py` watches exactly this measurement on the PCM each
+listener actually receives. A baseline floor profile is frozen over the
+take's first minute (after a short landing period); the high band (5-14
+kHz) of the trailing minute's floor must then rise at least 10 dB over its
+own baseline and clear an absolute audibility gate, in at least 80% of
+chunk evaluations across a 40-second window, before the take is declared
+drifted. The decision is deliberately spectral: a live-captured failure
+grew +22 dB of high-band hiss while its overall floor rose only +1 dB -
+the bed brightens long before it lifts - while a warm rumble or denser
+bass never qualifies. Level and spectrum are measured on the same
+quietest-decile blocks, so louder or denser playing does not qualify
+either - only the bed under it. The repair is a server-side equal-power
+crossfade onto a fresh recurrent state under the same conditioning (one
+extra chunk of render cost, deterministic refresh seed, no transport or
+session change): a subtle track change instead of a slowly degrading
+stream. Replayed against the captured takes, the guard fires mid-runaway
+on both failures, twice on the worst, never on the healthy 6-minute take,
+and costs one borderline cymbal-wash passage a single crossfade. Station
+changes re-learn the baseline, since the recurrent state - and any drift
+it carries - survives them. `MRT_TAKE_GUARD=0` disables the guard.
+
+**The client mastering chased dynamics.** The old loudness normalizer
+adapted over a +9 dB range fast enough to follow musical passages: every
+mellow stretch ratcheted the gain up - exactly when a floor is most
+audible - and the codec noise floor rose with it, up to +6.9 dB in
+simulation over a real take. It now applies the codec's known -6 dB int16
+headroom as an immediate fixed makeup stage and keeps only a ±3 dB
+station-leveling trim around it, moving slowly enough (minutes, not
+phrases) that the noise floor never depends on how quiet the last passage
+was. Simulated over the same take, worst-case floor lift drops from +6.9 to
++5.2 dB with the same average loudness, and the gain no longer tracks the
+music's dynamics at all.
 
 Batching still matters for the eager Python runtime:
 

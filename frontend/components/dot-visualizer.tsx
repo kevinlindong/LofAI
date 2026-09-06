@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, type ReactNode } from "react"
 import { BlobSet } from "@/lib/dot-field"
+import { paintInk, type InkCells, type InkGeometry } from "@/lib/ink-render"
 import {
   buildWave,
   SPOKES,
@@ -10,7 +11,6 @@ import {
   WAVE_CREST,
   WAVE_GLOW,
   WAVE_GLOW_AT,
-  WAVE_LIP,
 } from "@/lib/wave-scene"
 
 interface DotVisualizerProps {
@@ -20,13 +20,53 @@ interface DotVisualizerProps {
   children?: ReactNode
 }
 
-// the polar dot matrix the wave is struck on. the dots sit at a constant pitch
-// rather than a constant angle - each ring gets as many as fit around it - so
-// the field stays even instead of fanning into rays at the edge. what lights
-// them is a ring of metaballs; that part lives in lib/wave-scene.
+// the dot matrix the wave is struck on. the dots sit in rank and file - the
+// same square lattice as every other panel on the page - and the round wave
+// lights whichever of them it reaches, which is what a circle is on a real
+// matrix: a circle's worth of square cells. RINGS sets the pitch by dividing
+// the wave's radial travel into that many rows; INNER and OUTER are where
+// the wave's lip and its full-scale crest sit, and the lattice keeps a round
+// hole clear where the transport button lives. the ring of metaballs doing
+// the lighting lives in lib/wave-scene.
+//
+// the cells are not dots any more, they are ink. each one's field value is a
+// continuous fill rather than a yes/no, so a cell the wave is only just
+// reaching is a small bead and a cell inside a loud bar is saturated and
+// overlapping its neighbours - and wherever two adjacent cells are both wet,
+// lib/ink-render draws the pinched neck between them. the ring's edge beads,
+// joins and flows instead of switching on a dot at a time.
 const RINGS = 11
 const INNER = 0.52
 const OUTER = 0.96
+
+// the cells are dots again, and what makes them ink is what happens between
+// them: a dot that grows until it nears its neighbour pulls a tangent-continuous
+// membrane across to it, so the ring reads as one poured body with waists in it.
+// the numbers are fractions of the pitch, scaled once the pitch is known.
+const INK: InkGeometry = {
+  // a cell the wave has only breathed on. below about 0.29 of the pitch a dot
+  // cannot reach its neighbour at all, so the quietest ink is honestly separate
+  // beads and joining up is something the music does
+  minRadius: 0.16,
+  // at half the pitch two neighbours are exactly tangent; a little past it they
+  // overlap and a loud passage fuses into one sheet
+  maxRadius: 0.54,
+  spread: 0.5,
+  handleSize: 2.4,
+  reach: 2.5,
+  dryRadius: 0,
+  diagonals: true,
+  // the first fifth of a cell's fill is spent growing the dot in from nothing,
+  // so the wave's edge arrives as a swelling bead and leaves as a shrinking
+  // one, instead of blinking on and off at minRadius as the surface crawls
+  swellIn: 0.2,
+}
+
+// how the field maps to ink. a cell wets at the same value that used to earn
+// it a breath of glow and saturates a little under twice the surface, so the
+// crest is always the fullest ink on the panel.
+const WET_AT = WAVE_GLOW_AT
+const FULL_AT = SURFACE * 1.9
 
 // how quickly a column follows the spectrum, as time constants in seconds:
 // snaps up to a transient, settles back slowly. these are seconds rather than
@@ -55,8 +95,6 @@ const MIN_RANGE = 0.1
 // at a time, and at thirty that crawl reads as a stutter. sampling the field
 // over the whole lattice costs a tenth of a millisecond.
 const MIN_FRAME_MS = 0
-
-const TAU = Math.PI * 2
 
 const PALETTE_VARS = ["--dot-0", "--dot-1", "--dot-2", "--dot-3", "--dot-4", "--dot-5", "--dot-6"]
 
@@ -143,72 +181,129 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
     const shape = new Float32Array(half)
 
     // the dot lattice, rebuilt only when the canvas changes size. deriving it
-    // inside the draw loop meant a thousand-odd sin/cos pairs a frame; the
+    // inside the draw loop meant a thousand-odd distance checks a frame; the
     // field is what moves now, and the dots it is sampled at never do.
     let dotX = new Float32Array(0)
     let dotY = new Float32Array(0)
-    // for each dot, the dot one ring further out and one ring further in, or
-    // -1 off the ends of the lattice. the crest is taken from these rather
-    // than from a band of field values: the field falls off at a rate that
-    // depends on how big the blobs currently are, so a rim cut by value is two
-    // rings thick on a loud bar and gone on a quiet one, and every ring in
-    // between lands on its own rung of the ramp - which reads as speckle. cut
-    // from the neighbours it is exactly one dot wherever the surface happens
-    // to be.
+    // for each dot, its radial neighbour: the lattice dot nearest to one
+    // pitch further out along this dot's own radius, or -1 off the lattice. the crest is taken from these rather than
+    // from a band of field values: the field falls off at a rate that
+    // depends on how big the blobs currently are, so a rim cut by value is
+    // two dots thick on a loud bar and gone on a quiet one. cut from the
+    // radial neighbours it is exactly one dot wherever the surface happens
+    // to be - even though the dots themselves now sit in rank and file.
     let outward = new Int32Array(0)
-    let inward = new Int32Array(0)
     let value = new Float32Array(0)
-    let dotRadius = 1
+    // per cell: whether the field is over the surface there, and whether the
+    // cell is on the mask's radial rim (1 lip, 2 crest, 0 neither)
+    let interior = new Uint8Array(0)
+    let edge = new Uint8Array(0)
     let inner = 0
     let pitch = 1
-    let shades: Float32Array[] = []
-    const counts = new Int32Array(PALETTE_VARS.length)
+    let ink: InkCells | null = null
+    let inkGeo: InkGeometry = { ...INK }
+    // the overlays' geometry: same dots, no membranes (reach 0 means no pair
+    // is ever close enough to hold one)
+    let lineGeo: InkGeometry = { ...INK, reach: 0 }
     const blobs = new BlobSet()
+
+    // 0 below `from`, 1 above `to`, eased between. how much ink a cell holds is
+    // read off the field through this, so the wave's edge arrives as a swelling
+    // bead rather than as a cell switching on.
+    const ramp = (from: number, to: number, v: number) => {
+      const t = Math.min(1, Math.max(0, (v - from) / (to - from)))
+      return t * t * (3 - 2 * t)
+    }
 
     const layout = () => {
       const mid = size / 2
       inner = mid * INNER
       pitch = (mid * OUTER - inner) / (RINGS - 1)
-      dotRadius = Math.max(1, pitch * 0.3)
-
-      // as many dots as fit around each ring at the radial pitch
-      const around = (r: number) =>
-        Math.max(12, Math.round((TAU * (inner + r * pitch)) / pitch))
-
-      const counted: number[] = []
-      const starts: number[] = []
-      let total = 0
-      for (let r = 0; r < RINGS; r++) {
-        starts.push(total)
-        counted.push(around(r))
-        total += counted[r]
+      inkGeo = {
+        minRadius: INK.minRadius * pitch,
+        maxRadius: INK.maxRadius * pitch,
+        spread: INK.spread,
+        handleSize: INK.handleSize,
+        reach: INK.reach,
+        dryRadius: 0,
+        diagonals: INK.diagonals,
+        swellIn: INK.swellIn,
       }
+      lineGeo = { ...inkGeo, reach: 0 }
 
-      dotX = new Float32Array(total)
-      dotY = new Float32Array(total)
-      outward = new Int32Array(total)
-      inward = new Int32Array(total)
-      value = new Float32Array(total)
-
-      for (let r = 0; r < RINGS; r++) {
-        const d = inner + r * pitch
-        const n = counted[r]
-        for (let k = 0; k < n; k++) {
-          const i = starts[r] + k
-          const a = (k / n) * TAU
-          dotX[i] = Math.cos(a) * d
-          dotY[i] = Math.sin(a) * d
-          // the rings hold different numbers of dots, so a neighbour is
-          // whichever dot of the next ring round sits closest in angle
-          outward[i] =
-            r + 1 < RINGS
-              ? starts[r + 1] + (Math.round((k / n) * counted[r + 1]) % counted[r + 1])
-              : -1
-          inward[i] =
-            r > 0 ? starts[r - 1] + (Math.round((k / n) * counted[r - 1]) % counted[r - 1]) : -1
+      // a square lattice over the whole panel, odd-counted so a rank runs
+      // through dead centre and the grid is visibly aligned with the button.
+      // dots are struck out of a round hole in the middle where the button
+      // sits; everywhere else they exist and simply stay unlit until the
+      // wave reaches them, so the ring's edges are honestly grid-quantised
+      // rather than smoothed by a lattice bent to fit them.
+      const n = (Math.floor(size / pitch) - 1) | 1
+      const off = (n - 1) / 2
+      const hole = inner - pitch * 0.55
+      const rim = mid * OUTER + pitch * 0.75
+      const map = new Int32Array(n * n).fill(-1)
+      const xs: number[] = []
+      const ys: number[] = []
+      for (let gy = 0; gy < n; gy++) {
+        for (let gx = 0; gx < n; gx++) {
+          const x = (gx - off) * pitch
+          const y = (gy - off) * pitch
+          const d = Math.hypot(x, y)
+          // inside the hole the button lives; past the rim the wave cannot
+          // reach, and dots that can never light are not part of the panel
+          if (d < hole || d > rim) continue
+          map[gy * n + gx] = xs.length
+          xs.push(x)
+          ys.push(y)
         }
       }
-      shades = PALETTE_VARS.map(() => new Float32Array(total * 2))
+
+      const total = xs.length
+      dotX = Float32Array.from(xs)
+      dotY = Float32Array.from(ys)
+      outward = new Int32Array(total)
+      value = new Float32Array(total)
+      interior = new Uint8Array(total)
+      edge = new Uint8Array(total)
+
+      const at = (x: number, y: number): number => {
+        const gx = Math.round(x / pitch + off)
+        const gy = Math.round(y / pitch + off)
+        return gx >= 0 && gx < n && gy >= 0 && gy < n ? map[gy * n + gx] : -1
+      }
+      const right = new Int32Array(total)
+      const left = new Int32Array(total)
+      const down = new Int32Array(total)
+      const downRight = new Int32Array(total)
+      const downLeft = new Int32Array(total)
+      for (let i = 0; i < total; i++) {
+        const x = dotX[i]
+        const y = dotY[i]
+        const d = Math.hypot(x, y) || 1
+        const ux = (x / d) * pitch
+        const uy = (y / d) * pitch
+        outward[i] = at(x + ux, y + uy)
+        // the ink's neighbours are the lattice's own, not the wave's radial
+        // ones: ink flows between cells that are actually side by side, which
+        // around a ring means sideways as much as outward
+        right[i] = at(x + pitch, y)
+        left[i] = at(x - pitch, y)
+        down[i] = at(x, y + pitch)
+        downRight[i] = at(x + pitch, y + pitch)
+        downLeft[i] = at(x - pitch, y + pitch)
+      }
+      ink = {
+        count: total,
+        x: dotX,
+        y: dotY,
+        fill: new Float32Array(total),
+        shade: new Uint8Array(total),
+        right,
+        left,
+        down,
+        downRight,
+        downLeft,
+      }
     }
     layout()
 
@@ -259,10 +354,11 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
         if (written > 0) {
           target = (0.18 + 0.82 * gain) * (0.05 + 0.95 * shape[i])
         } else {
-          // at rest, a slow breath. it used to be a swell travelling round the
-          // ring, which is a spin by another name - this one is the same on
-          // every spoke, so nothing on the panel goes round.
-          target = 0.1 + 0.045 * Math.sin(now / 1300) + 0.03 * Math.sin(i * 1.7)
+          // at rest, a slow breath. the same target on every spoke, so the
+          // resting wave is a true circle: quantised onto the lattice it
+          // reads as deliberate matrix geometry, where even a small fixed
+          // per-spoke offset reads as a wobble in what should be a still ring
+          target = 0.1 + 0.045 * Math.sin(now / 1300)
         }
         amp[s] += (target - amp[s]) * (target > amp[s] ? rise : fall)
       }
@@ -274,51 +370,71 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
       })
 
       ctx.clearRect(0, 0, size, size)
-      counts.fill(0)
-
-      for (let i = 0; i < value.length; i++) value[i] = blobs.at(dotX[i], dotY[i])
+      if (!ink) return
+      const fill = ink.fill
 
       for (let i = 0; i < value.length; i++) {
-        const v = value[i]
-        let shade: number
-        if (v >= SURFACE) {
-          const out = outward[i]
-          const inn = inward[i]
-          // off either end of the lattice counts as empty, so a wave that has
-          // run past the edge still gets a line drawn along it
-          shade =
-            out < 0 || value[out] < SURFACE
-              ? WAVE_CREST
-              : inn < 0 || value[inn] < SURFACE
-                ? WAVE_LIP
-                : WAVE_BODY
-        } else if (v >= WAVE_GLOW_AT) {
-          shade = WAVE_GLOW
-        } else {
+        const v = blobs.at(dotX[i], dotY[i])
+        value[i] = v
+        interior[i] = v >= SURFACE ? 1 : 0
+      }
+
+      // the crest is read off the thresholded mask's radial neighbours, not
+      // off a band of field values - the field falls off at a rate that
+      // depends on how big the blobs currently are, so a rim cut by value is
+      // two dots thick on a loud bar and gone on a quiet one. off either end
+      // of the lattice counts as empty, so a wave that has run past the edge
+      // still gets a line drawn along it.
+      for (let i = 0; i < value.length; i++) {
+        if (!interior[i]) {
+          edge[i] = 0
           continue
         }
-        const at = counts[shade]
-        const buffer = shades[shade]
-        buffer[at] = dotX[i]
-        buffer[at + 1] = dotY[i]
-        counts[shade] = at + 2
+        const out = outward[i]
+        edge[i] = out < 0 || !interior[out] ? 1 : 0
       }
 
       const mid = size / 2
       ctx.save()
       ctx.translate(mid, mid)
-      for (let v = 0; v < shades.length; v++) {
-        const filled = counts[v]
-        if (filled === 0) continue
-        const buffer = shades[v]
-        ctx.fillStyle = palette[v]
-        ctx.beginPath()
-        for (let i = 0; i < filled; i += 2) {
-          ctx.moveTo(buffer[i] + dotRadius, buffer[i + 1])
-          ctx.arc(buffer[i], buffer[i + 1], dotRadius, 0, TAU)
-        }
-        ctx.fill()
+
+      // the wave is one liquid, painted as nested bodies rather than as
+      // side-by-side shade chains. each layer is a superset of the one above,
+      // so each is a continuous mass in its own right: the seams between
+      // shades land INSIDE ink instead of being gaps between bead chains, and
+      // a cell crossing a threshold changes which overlays cover it without
+      // ever breaking the body underneath.
+
+      // the skirt: everything the wave has breathed on, one dim mass that
+      // saturates exactly at the surface, so the interior always sits on
+      // solid ink. the curve is squared: near the surface it must be solid -
+      // it is what the interior stands on - but out in the glow it should be
+      // announcing the wave in small beads, not shadowing it in fat ones.
+      for (let i = 0; i < fill.length; i++) {
+        const t = ramp(WET_AT, SURFACE, value[i])
+        fill[i] = t * t
       }
+      paintInk(ctx, ink, inkGeo, [palette[WAVE_GLOW]])
+
+      // the interior: the mass proper. gated on the mask with a floor rather
+      // than ramped from the surface value, so the body reaches all the way
+      // out under the crest riding its edge instead of receding a cell
+      // inside it and leaving the boundary dots on bare skirt.
+      for (let i = 0; i < fill.length; i++)
+        fill[i] = interior[i] ? 0.5 + 0.5 * ramp(SURFACE, FULL_AT, value[i]) : 0
+      paintInk(ctx, ink, inkGeo, [palette[WAVE_BODY]])
+
+      // the crest rides on top: a one-dot bright line marking the surface.
+      // struck as plain dots, not fused - a quantised circle crosses the
+      // lattice as a staircase, and beads joined along a staircase read as a
+      // worm weaving round the ring, not as a surface. the liquid is the mass
+      // underneath; the line riding it is the honest matrix. a floor keeps it
+      // legible - a boundary cell's field value is pinned near the surface by
+      // definition, so filled straight off the field it would be pinpricks.
+      for (let i = 0; i < fill.length; i++)
+        fill[i] = edge[i] ? 0.55 + 0.45 * ramp(SURFACE, FULL_AT, value[i]) : 0
+      paintInk(ctx, ink, lineGeo, [palette[WAVE_CREST]])
+
       ctx.restore()
     }
 

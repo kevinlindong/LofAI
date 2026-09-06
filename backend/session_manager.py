@@ -9,6 +9,7 @@ from collections import deque
 import engine as engine_mod
 import styles
 from session import ACTIVE, QUEUED, SUSPENDED, Session
+from take_health import crossfade_pcm
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,11 @@ MAX_ACTIVE = max(1, _env_int("MRT_MAX_SESSIONS", 1))
 
 # how long a paused or disconnected session keeps its state before being reaped
 SESSION_TTL = _env_float("MRT_SESSION_TTL", 300.0)
+
+# Guards long takes against the model amplifying its own noise floor. When a
+# session's quiet-block floor rises audibly above its own early baseline, the
+# worker crossfades onto a fresh recurrent state mid-stream. See take_health.
+TAKE_GUARD = _env_int("MRT_TAKE_GUARD", 1) != 0
 
 # ceiling on retained sessions, so suspended state cannot pile up unbounded
 MAX_TOTAL = max(MAX_ACTIVE, _env_int("MRT_MAX_SESSIONS_TOTAL", 8))
@@ -564,6 +570,11 @@ class SessionManager:
                 "mlxCacheLimitMB": self.engine.mlx_cache_mb,
                 "pipelined": self.engine._fast,
                 "fastSampler": self.engine._fast_sampling,
+                "fastEngine": (
+                    self.engine._fast_engine.summary()
+                    if getattr(self.engine, "_fast_engine", None) is not None
+                    else None
+                ),
                 "codebooks": self.engine.codebooks,
                 "minCodebooks": self.engine.min_codebooks,
                 "maxCodebooks": self.engine.max_codebooks,
@@ -623,6 +634,7 @@ class SessionManager:
 
                 maximum_frames = self._chunk_frames(session)
                 started = time.monotonic()
+                refreshed_seed = None
                 try:
                     render_epoch = session.prepare_render()
                     frames = maximum_frames
@@ -630,6 +642,27 @@ class SessionManager:
                     pcm, next_state = self.engine.generate(
                         session.state, plan, seed=session.seed
                     )
+                    if TAKE_GUARD:
+                        monitor = session.floor_monitor
+                        monitor.observe(pcm)
+                        if monitor.drifted:
+                            # The take has audibly grown a hiss bed out of its
+                            # own feedback. Splice onto a fresh recurrent state
+                            # under the same conditioning: one extra chunk of
+                            # render cost, no transport or session change.
+                            refreshed_seed = session.next_refresh_seed()
+                            fresh_pcm, fresh_state = self.engine.generate(
+                                None, plan, seed=refreshed_seed
+                            )
+                            log.info(
+                                "session %s take drifted (%s); crossfading onto "
+                                "a fresh state",
+                                session.id[:8],
+                                monitor.describe(),
+                            )
+                            pcm = crossfade_pcm(pcm, fresh_pcm)
+                            next_state = fresh_state
+                            monitor.reset()
                 except Exception as exc:  # noqa: BLE001 - isolate bad sessions
                     if self._stopping.is_set():
                         break
@@ -652,6 +685,8 @@ class SessionManager:
                     if not session.render_is_current(render_epoch):
                         continue
                     session.state = next_state
+                    if refreshed_seed is not None:
+                        session.seed = refreshed_seed
                     self.engine.note_render(
                         frames,
                         time.monotonic() - started,

@@ -1,9 +1,11 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
+import { gridNeighbours, paintInk, type InkCells, type InkGeometry } from "@/lib/ink-render"
 import {
   drawPet,
   IDLE_FRAME,
+  INK,
   PET_H,
   PET_W,
   type PetFrame,
@@ -41,6 +43,31 @@ const PALETTE_VARS = [
   "--dot-7",
 ]
 
+// the cat is ink on the matrix rather than a grid of dots. each cell is a dot
+// that swells with how much ink the field put there, and neighbouring dots of
+// the same shade pull a tangent-continuous membrane between them - so the fur
+// is one poured mass and the one-cell rim around it is a liquid outline. see
+// lib/ink-render for the connector's geometry and where it comes from.
+//
+// cells only ever fuse within their own shade, which is what keeps the rim a
+// line around the body instead of melting into it, and keeps a marking a
+// marking.
+const INK_GEO: InkGeometry = {
+  // fractions of the pitch, scaled once the pitch is known
+  minRadius: 0.22,
+  maxRadius: 0.54,
+  spread: 0.5,
+  handleSize: 2.4,
+  reach: 2.5,
+  dryRadius: 0.2,
+  diagonals: true,
+}
+
+// the unlit panel, and the sockets cut out of the fur. drawn as plain small
+// cells with no necks: bridged, the background would fuse into one sheet and
+// the matrix would stop being a matrix.
+const DRY_SHADE = 0
+
 // how long each reaction holds the cat's face
 const HOLD_MS: Record<Reaction, number> = {
   add: 750,
@@ -67,10 +94,17 @@ const MIN_FRAME_MS = 0
 const BOB_ATTACK = 0.033
 const BOB_RELEASE = 0.27
 
+// the analyser's RMS wobbles a few percent from one frame to the next even
+// inside a steady bar, and everything the bob touches - the squash, the tail
+// speed, the sway - used to tremble with it. a short pre-filter takes the
+// fizz off the measurement without dulling the beat: fifty milliseconds is
+// well inside the attack of any lofi kick.
+const LEVEL_SMOOTH = 0.05
+
 // how long the cat takes to settle into the music, and to settle out of it
-// again. the bop rides the loaf up off the ground between beats, so this is
-// the difference between a cat finding the groove and a cat teleporting a dot
-// upwards the instant the first note arrives.
+// again. the head's rock and nod ride this ramp, so the first note eases the
+// cat into keeping time over a second or so instead of snapping its head
+// sideways the instant the stream starts.
 const GROOVE_FOLLOW = 0.45
 
 // how fast the eyes catch up with the cursor. slow enough to be a head turning
@@ -186,27 +220,52 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     })
     sizeWatch.observe(wrap)
 
-    const paint = (frame: PetFrame) => {
-      const grid = drawPet(frame)
-      const r = Math.max(1, pitch * 0.4)
-      ctx.clearRect(0, 0, PET_W * pitch, PET_H * pitch)
-      // one path per colour: 1500 dots is nothing, 1500 state changes is not
-      for (let v = 0; v < palette.length; v++) {
-        ctx.fillStyle = palette[v]
-        ctx.beginPath()
-        for (let i = 0; i < grid.length; i++) {
-          if (grid[i] !== v) continue
-          const x = (i % PET_W) * pitch + pitch / 2
-          const y = Math.floor(i / PET_W) * pitch + pitch / 2
-          ctx.moveTo(x + r, y)
-          ctx.arc(x, y, r, 0, Math.PI * 2)
+    // the lattice never changes shape, so its neighbour tables are built once
+    const neighbours = gridNeighbours(PET_W, PET_H)
+    const cells: InkCells = {
+      count: PET_W * PET_H,
+      x: new Float32Array(PET_W * PET_H),
+      y: new Float32Array(PET_W * PET_H),
+      fill: new Float32Array(PET_W * PET_H),
+      shade: new Uint8Array(PET_W * PET_H),
+      ...neighbours,
+    }
+    let placedAt = -1
+    // cell centres in pixels, re-laid only when the pitch changes
+    const place = () => {
+      if (placedAt === pitch) return
+      placedAt = pitch
+      for (let r = 0; r < PET_H; r++) {
+        for (let c = 0; c < PET_W; c++) {
+          const i = r * PET_W + c
+          cells.x[i] = c * pitch + pitch / 2
+          cells.y[i] = r * pitch + pitch / 2
         }
-        ctx.fill()
       }
     }
 
+    const paint = (frame: PetFrame) => {
+      const grid = drawPet(frame)
+      place()
+      const geo: InkGeometry = {
+        minRadius: INK_GEO.minRadius * pitch,
+        maxRadius: INK_GEO.maxRadius * pitch,
+        spread: INK_GEO.spread,
+        handleSize: INK_GEO.handleSize,
+        reach: INK_GEO.reach,
+        dryRadius: Math.max(0.7, INK_GEO.dryRadius * pitch),
+        diagonals: INK_GEO.diagonals,
+      }
+      for (let i = 0; i < grid.length; i++) {
+        cells.shade[i] = grid[i]
+        cells.fill[i] = INK[i]
+      }
+      ctx.clearRect(0, 0, PET_W * pitch, PET_H * pitch)
+      paintInk(ctx, cells, geo, palette, DRY_SHADE)
+    }
+
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      const resting: PetFrame = { ...IDLE_FRAME, phase: 1 }
+      const resting: PetFrame = { ...IDLE_FRAME, phase: 1, swing: 0.6, breathe: 1 }
       redrawStill = () => paint(resting)
       redrawStill()
       return () => {
@@ -216,8 +275,18 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     }
 
     let raf = 0
+    let raw = 0
     let smoothed = 0
+    let bobAvg = 0
     let groove = 0
+    // the tail and the ribs each carry their own phase, advanced by a rate
+    // rather than read off the clock. the rates change - the tail swishes
+    // faster when the music hits, sleep breathes slower - and a sine fed
+    // `clock × rate` jumps to a random point in its cycle every time the rate
+    // moves, because the clock is minutes long. integrating keeps every
+    // change of speed seamless.
+    let swing = 0
+    let breathe = 0
     let gazeX = 0
     let gazeY = 0
     let affection = 0
@@ -234,11 +303,14 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
       last = now
 
       // fast attack, slow release - the head drops on the beat and comes back
-      // up between them, instead of vibrating at frame rate
+      // up between them, instead of vibrating at frame rate. the pre-filter
+      // strips the frame-to-frame fizz off the measurement first, so the
+      // envelope rides the music rather than the noise floor of the analyser.
       const level = Math.min(1, levelRef.current() * 4)
+      raw += (level - raw) * (1 - Math.exp(-dt / LEVEL_SMOOTH))
       smoothed +=
-        (level - smoothed) *
-        (1 - Math.exp(-dt / (level > smoothed ? BOB_ATTACK : BOB_RELEASE)))
+        (raw - smoothed) *
+        (1 - Math.exp(-dt / (raw > smoothed ? BOB_ATTACK : BOB_RELEASE)))
       const wants = playingRef.current ? 1 : 0
       groove += (wants - groove) * (1 - Math.exp(-dt / GROOVE_FOLLOW))
 
@@ -339,14 +411,34 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         setCaption(CAPTIONS[mood])
       }
 
+      const bob = playingRef.current ? Math.min(1, smoothed * 1.6) : 0
+      // the beat as a beat: how far this instant stands above the mix's own
+      // slowly-tracked level. bob's release never reaches zero between kicks
+      // in a busy mix, so anything that should LAND on the rhythm - the nod,
+      // the tail's flick - rides this instead of bob.
+      bobAvg += (bob - bobAvg) * (1 - Math.exp(-dt / 0.8))
+      const pulse = playingRef.current ? Math.min(1, Math.max(0, (bob - bobAvg) * 2.2)) : 0
+      // advance the tail and the breath by this frame's rate. the tail's
+      // rate leans hard on the pulse: each kick propels a visible sweep of
+      // the curl and it coasts between kicks, which is what puts the tail on
+      // the music's rhythm without any beat detector - and because the rate
+      // feeds an accumulated phase, the hardest transient can only ever
+      // speed the swish up, never tear it. sleep slows the ribs; both stay
+      // continuous however hard the rates move.
+      swing += dt * (0.9 + pulse * 3.6)
+      breathe += dt * (mood === "sleep" ? 0.7 : 1.15)
+
       paint({
         mood,
         blink: now < blinkUntil,
-        bob: playingRef.current ? Math.min(1, smoothed * 1.6) : 0,
+        bob,
+        pulse,
         hop,
         twitch,
         pat,
         phase: now / 1000,
+        swing,
+        breathe,
         notes: playingRef.current,
         groove,
         sparkle,

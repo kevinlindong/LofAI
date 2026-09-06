@@ -3,6 +3,23 @@
 @tailwind utilities;
 
 /*
+   ENDLESS, the geometric sans the ASCII background is set in:
+   https://www.behance.net/gallery/247864363/ENDLESS-Geometric-Sans-Serif-Free-Font
+
+   The family is not redistributable from this repository, so the file is not
+   checked in. Drop a woff2 build at frontend/public/fonts/endless.woff2 and it
+   is picked up with no code change; until then a missing file fails silently
+   here and the marks fall back to the monospace stack below, which is a
+   different texture but not a broken page.
+*/
+@font-face {
+  font-family: "ENDLESS";
+  src: url("/fonts/endless.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+/*
    The smooth interface is the canvas; the dot language is now an accent used
    by the logo, the spectrum and the companion. Both themes share the same
    coral / mint atmosphere so the animated field feels like one continuous
@@ -33,11 +50,10 @@
     --shadow-soft: 0 10px 30px rgba(54, 65, 57, 0.08);
     --page-wash: rgba(255, 255, 255, 0.7);
 
-    /* space-separated RGB values are read directly by the metaball canvas */
-    --blob-a: 239 128 78;
-    --blob-b: 67 165 145;
-    --blob-c: 222 178 88;
-    --blob-opacity: 0.33;
+    /* the ASCII background layer. ink struck on paper takes a little more
+       presence than light behind glass does before it reads at all. */
+    --font-ascii: "ENDLESS", var(--font-dot), ui-monospace, monospace;
+    --ascii-opacity: 0.055;
 
     /* dot artwork palette */
     --dot-0: #e5e5da;
@@ -93,10 +109,7 @@
     --shadow-soft: 0 12px 35px rgba(0, 0, 0, 0.22);
     --page-wash: rgba(110, 139, 121, 0.11);
 
-    --blob-a: 226 102 67;
-    --blob-b: 56 155 136;
-    --blob-c: 205 153 72;
-    --blob-opacity: 0.28;
+    --ascii-opacity: 0.045;
 
     --dot-0: #202a25;
     --dot-1: #3e5047;
@@ -186,18 +199,93 @@
     mix-blend-mode: multiply;
   }
 
-  .metaball-field {
+  /* the ASCII background layer. it is fixed, behind everything, and animated
+     entirely by the compositor - see components/ascii-ambience.tsx for why.
+     --ax/--ay are the cursor across the viewport as -1..1; the component sets
+     them and nothing here reads anything back. */
+  .ascii-ambience {
+    --ax: 0;
+    --ay: 0;
     position: fixed;
     z-index: -2;
-    inset: -3rem;
+    inset: 0;
+    overflow: hidden;
     pointer-events: none;
-    filter: blur(2px) saturate(112%);
   }
 
-  .metaball-field canvas {
+  .ascii-mark {
+    --depth: 0px;
+    position: absolute;
+    color: var(--text);
+    font-family: var(--font-ascii);
+    font-weight: 400;
+    letter-spacing: 0.22em;
+    line-height: 1;
+    opacity: var(--ascii-opacity);
+    user-select: none;
+    white-space: nowrap;
+    /* the cursor's pull. its own property, so it composes with the drift
+       keyframes' transform rather than being overwritten by them - and the long
+       transition is what turns a jumpy pointer into a lazy lean. */
+    translate: calc(var(--ax) * var(--depth)) calc(var(--ay) * var(--depth));
+    transition: translate 1.4s cubic-bezier(0.22, 0.61, 0.36, 1);
+    will-change: transform, translate;
+  }
+
+  /* the cursor's own mark: liquid ink dragged across the page's dot matrix,
+     drawn with the same metaball membranes as the visualiser and the cat. the
+     component only ever repaints the trail's own bounding box, and its draw
+     loop stops the moment the last droplet dries. */
+  .ink-trail {
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
-    image-rendering: auto;
+  }
+
+  /* six marks, each on its own slow period. the periods are mutually
+     irrational-ish on purpose: on round multiples they would all reach the top
+     of their travel together every half minute and read as a pulse. */
+  .ascii-mark-1 {
+    top: 9%;
+    left: 6%;
+    font-size: clamp(3.5rem, 9vw, 8rem);
+    animation: ascii-drift-a 47s ease-in-out infinite;
+  }
+
+  .ascii-mark-2 {
+    top: 62%;
+    left: 11%;
+    font-size: clamp(5rem, 13vw, 12rem);
+    animation: ascii-drift-b 61s ease-in-out infinite;
+  }
+
+  .ascii-mark-3 {
+    top: 21%;
+    right: 8%;
+    font-size: clamp(4rem, 10vw, 9rem);
+    animation: ascii-drift-b 53s ease-in-out infinite;
+  }
+
+  .ascii-mark-4 {
+    top: 78%;
+    right: 14%;
+    font-size: clamp(2.6rem, 7vw, 6rem);
+    animation: ascii-drift-a 67s ease-in-out infinite;
+  }
+
+  .ascii-mark-5 {
+    top: 44%;
+    right: 33%;
+    font-size: clamp(3rem, 8vw, 7rem);
+    animation: ascii-drift-c 73s ease-in-out infinite;
+  }
+
+  .ascii-mark-6 {
+    top: 88%;
+    left: 38%;
+    font-size: clamp(3rem, 8vw, 7rem);
+    animation: ascii-drift-c 59s ease-in-out infinite;
   }
 
   .app-frame {
@@ -718,6 +806,41 @@
   background: color-mix(in srgb, var(--text-faint) 50%, transparent);
 }
 
+/* the background's whole animation budget: three slow translations, run by the
+   compositor. transform and opacity only - anything that touches layout here
+   would put the cost straight back on the main thread. */
+@keyframes ascii-drift-a {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(0deg);
+  }
+  50% {
+    transform: translate3d(2.5rem, -1.8rem, 0) rotate(2deg);
+  }
+}
+
+@keyframes ascii-drift-b {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(0deg);
+  }
+  50% {
+    transform: translate3d(-2.2rem, 2.4rem, 0) rotate(-3deg);
+  }
+}
+
+@keyframes ascii-drift-c {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+    opacity: var(--ascii-opacity);
+  }
+  50% {
+    transform: translate3d(1.4rem, 2rem, 0);
+    opacity: calc(var(--ascii-opacity) * 0.45);
+  }
+}
+
 @keyframes status-pulse {
   0% {
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 48%, transparent);
@@ -871,8 +994,21 @@
   .brand-flow span,
   .status-orb.is-live,
   .visualizer-stage::after,
-  .play-key {
+  .play-key,
+  .ascii-mark {
     animation: none;
+  }
+
+  /* the cursor's mark never appears, and the marks never lean: the component
+     does not install its pointer listener at all in this mode, so these are
+     belt and braces rather than the mechanism */
+  .ascii-mark,
+  .ascii-trail {
+    translate: none;
+  }
+
+  .ascii-trail {
+    display: none;
   }
 
   *,

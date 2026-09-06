@@ -9,6 +9,7 @@ import numpy as np
 
 import engine as engine_mod
 from music_controls import MusicControls
+from take_health import TakeFloorMonitor
 
 
 def _env_float(name: str, default: float) -> float:
@@ -129,6 +130,13 @@ class Session:
         # worker knows to start it in small chunks and grow to steady state
         self.chunks_rendered = 0
 
+        # Watches the delivered PCM for the recurrent-state failure where the
+        # model slowly amplifies a hiss bed it has fed back to itself. The
+        # worker consults it and, when a take has audibly drifted, crossfades
+        # onto a fresh state without touching the session or transport.
+        self.floor_monitor = TakeFloorMonitor()
+        self._refreshes = 0
+
         # Set by the websocket handler while a client is attached. The worker
         # supplies ``(pcm, render_epoch)`` so deferred event-loop delivery can
         # reject audio from a superseded variation.
@@ -216,7 +224,18 @@ class Session:
                 self._ramp_elapsed = 0.0
                 self._ramping = False
                 self._reset_requested = False
+                self.floor_monitor.reset()
             return self._render_epoch
+
+    def next_refresh_seed(self) -> int:
+        """Deterministic seed for the nth mid-take state refresh."""
+        with self._lock:
+            self._refreshes += 1
+            return _seed_for(f"{self.id}:refresh:{self._refreshes}")
+
+    @property
+    def refreshes(self) -> int:
+        return self._refreshes
 
     def render_is_current(self, epoch: int) -> bool:
         with self._lock:
@@ -325,6 +344,10 @@ class Session:
             self._active_prompt = prompt
             self._active_reference = reference
             self._active_style_key = self._style_key(engine, prompt, reference)
+            # The recurrent state - and any drift it carries - survives a
+            # station change, but the new station's own gap floor is a new
+            # normal. Re-learn the baseline rather than comparing stations.
+            self.floor_monitor.reset()
             if self._current is not None:
                 # ramp from wherever we are now, which may itself be mid-ramp
                 self._ramp_from = self._current
@@ -414,7 +437,7 @@ class Session:
         return (
             engine.default_sampling()
             if hasattr(engine, "default_sampling")
-            else engine_mod.SamplingControls(1.0, 100, 3.0, 5.0, 1.0)
+            else engine_mod.SamplingControls(1.0, 100, 3.0, 1.0, 1.0)
         )
 
     def _ramp_at(self, elapsed: float) -> tuple[np.ndarray, str | None]:
@@ -444,4 +467,5 @@ class Session:
             "generatedSeconds": round(self.generated_seconds, 1),
             "realtimeFactor": round(self.realtime_factor(), 3),
             "gaps": self.gaps,
+            "takeRefreshes": self._refreshes,
         }

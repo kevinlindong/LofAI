@@ -437,12 +437,33 @@ await test("mastering raises quiet material slowly and keeps volume after the li
   socket.onmessage({
     data: JSON.stringify({ type: "status", state: "active", realtimeFactor: 1.2 }),
   })
+  // The codec's -6 dB headroom is undone by a fixed makeup stage immediately;
+  // only the small station trim converges over time.
+  assert.ok(
+    Math.abs(runtime.gains[0].gain.value - 10 ** (5 / 20)) < 1e-9,
+    "fixed makeup gain was not applied from the start",
+  )
   const loudnessTick = [...runtime.intervals.values()][0].fn
   loudnessTick()
   loudnessTick()
   loudnessTick()
-  assert.ok(runtime.gains[0].gain.value > 1, "quiet material did not receive slow makeup")
-  assert.ok(runtime.gains[0].gain.value < 1.2, "normalizer jumped instead of moving slowly")
+  assert.ok(
+    runtime.gains[0].gain.value > 10 ** (5 / 20),
+    "quiet material did not receive a slow upward trim",
+  )
+  assert.ok(
+    runtime.gains[0].gain.value < 10 ** (5.7 / 20),
+    "normalizer trim moved faster than its rate limit",
+  )
+  // A long mellow stretch must never ratchet the gain (and with it the noise
+  // floor) beyond makeup plus the small trim bound. The pre-fix normalizer
+  // followed musical dynamics up to +9 dB, which listeners heard as a slowly
+  // rising background hiss.
+  for (let i = 0; i < 180; i++) loudnessTick()
+  assert.ok(
+    runtime.gains[0].gain.value <= 10 ** (8 / 20) + 1e-9,
+    "normalizer gain exceeded makeup plus its trim bound",
+  )
 
   stream.setVolume(0.4)
   assert.equal(runtime.gains[2].gain.value, 0.4)

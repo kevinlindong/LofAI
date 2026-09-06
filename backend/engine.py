@@ -143,26 +143,42 @@ class MRTEngine:
         # all. keep the eager path until a newer mlx ships; whatever the export
         # was worth, the eager path pipelines now and has closed some of it.
         self.backend = os.environ.get("MRT_BACKEND", "python")
-        # Four-bit weights are the best live trade on the baseline 8 GB M1:
-        # they load in roughly half the time and leave enough margin to retain
-        # 10-12 codec layers. Codec-layer truncation is reserved for measured
-        # pressure because it also changes the recurrent audio-token history.
-        self.bits = _env_int("MRT_BITS", 4)
+        # Eight-bit weights are the live default. On this project's baseline
+        # 8GB M1 the 4-bit/8-bit gap was ~1.7ms per frame, and the specialized
+        # step loop below buys that back without spending fidelity; on an
+        # M3-class machine the gap is ~0.8ms against a 20ms frame. Four-bit
+        # round-to-nearest quantization of the *entire* sampler - including
+        # the SpectroStream codec decoder that turns tokens into waveforms and
+        # every embedding table - was the largest audible cost in the old
+        # default. When 4-bit is explicitly requested for memory, the codec
+        # keeps 8-bit weights: token prediction degrades gracefully, decoding
+        # those tokens to audio does not.
+        self.bits = _env_int("MRT_BITS", 8)
 
-        # Match magentart::core's live defaults. The former 1.1/50/1.6/2.4/4
-        # combination over-constrained drums and reduced the sampler's useful
-        # choices without buying throughput (CFG is encoded as tokens here).
+        # Match magentart::core's live defaults for sampling. CFG is encoded
+        # as conditioning tokens here, so scale choices cost no throughput.
+        # Notes guidance defaults to the library's 1.0: the live path never
+        # sends MIDI, and both checkpoints were trained with the notes CFG
+        # token co-varying with real piano-roll data. Telling the model every
+        # frame to follow a fully masked score with strength 5 is conditioning
+        # it outside anything it saw in training; 5.0 remains reasonable only
+        # when actual notes are supplied (the evaluation harness may do so).
         self.temperature = _env_float("MRT_TEMPERATURE", 1.0)
         self.top_k = _env_int("MRT_TOP_K", 100)
         self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 3.0)
-        self.cfg_notes = _env_float("MRT_CFG_NOTES", 5.0)
+        self.cfg_notes = _env_float("MRT_CFG_NOTES", 1.0)
         self.cfg_drums = _env_float("MRT_CFG_DRUMS", 1.0)
 
-        # The official live engine keeps the coarse half of MusicCoCa's RVQ
-        # tokens and masks its fine tail. Broad musical style survives while
-        # brittle prompt-specific detail does not oversteer every frame.
+        # Send MusicCoCa's full 12-level RVQ token stack. Neither mrt2 model
+        # was trained with style-token masking (`mask_musiccoca=False` in the
+        # model configs): every training frame carried all 12 levels, with
+        # only independent 15% per-token dropout. Masking the fine half at
+        # inference therefore puts the conditioning encoder outside its
+        # training distribution on every frame - it audibly weakened style
+        # adherence rather than stabilising it. The mask remains available as
+        # an explicit experiment via MRT_STYLE_TOKEN_LEVELS.
         self.style_token_levels = max(
-            1, min(12, _env_int("MRT_STYLE_TOKEN_LEVELS", 6))
+            1, min(12, _env_int("MRT_STYLE_TOKEN_LEVELS", 12))
         )
 
         # what the auto-tuner aims for. anything under 1.0 means the machine
@@ -177,6 +193,7 @@ class MRTEngine:
         self.target_rtf = _env_float("MRT_TARGET_RTF", 1.18)
         self.mlx_cache_mb = _env_int("MRT_MLX_CACHE_MB", 384)
         self.fast_sampler_enabled = _env_int("MRT_FAST_SAMPLER", 1) != 0
+        self.fast_engine_enabled = _env_int("MRT_FAST_ENGINE", 1) != 0
 
         # 0 keeps the live auto-tuner; any other value pins the codebook count.
         # Evaluation and offline renders explicitly pin all 12, while the live
@@ -210,6 +227,7 @@ class MRTEngine:
         # fast path handles, filled in by _prepare_fast_path
         self._fast = False
         self._fast_sampling = False
+        self._fast_engine = None
         self._sampler = None
         self._input_spec = None
         self._depth_config = None
@@ -355,9 +373,17 @@ class MRTEngine:
         log.info("loading %s (python backend, %s)", self.size, precision)
         # SequenceLayers asks NumPy for the *shape* of a mean over an unfilled
         # dummy array while materializing deferred layers. No value is consumed.
-        return MagentaRT2System(
+        #
+        # At 4 bits the library call would also quantize the SpectroStream
+        # codec decoder and every embedding table to 4-bit round-to-nearest,
+        # which is where most of the audible damage was. Load unquantized in
+        # that case and quantize the two halves separately below.
+        library_bits = self.bits or None
+        if self.bits == 4:
+            library_bits = None
+        system = MagentaRT2System(
             size=self.size,
-            bits=self.bits or None,
+            bits=library_bits,
             temperature=self.temperature,
             top_k=self.top_k,
             cfg_scales={
@@ -366,6 +392,17 @@ class MRTEngine:
                 "drums": self.cfg_drums,
             },
         )
+        if self.bits == 4:
+            import mlx.nn as nn
+
+            # Language model at 4-bit for memory-constrained machines; the
+            # audio codec keeps 8-bit weights. The codec is 52M of the 282M
+            # parameters, so this costs a fraction of the saved bandwidth
+            # while keeping token-to-waveform decoding clean.
+            nn.quantize(system._sampler.depthformer, group_size=32, bits=4)
+            nn.quantize(system._sampler.spectrostream, group_size=64, bits=8)
+            log.info("quantized: depthformer 4-bit, spectrostream codec 8-bit")
+        return system
 
     def _prepare_fast_path(self):
         # our own step loop needs three things the library keeps private: the
@@ -395,6 +432,17 @@ class MRTEngine:
                 except Exception as exc:  # noqa: BLE001 - optional specialization
                     log.warning("fast sampler unavailable; using Magenta's: %s", exc)
                     self._fast_sampling = False
+
+            if self.fast_engine_enabled:
+                try:
+                    from fast_engine import install as install_fast_engine
+
+                    self._fast_engine = install_fast_engine(self._system, mx, sl)
+                except Exception as exc:  # noqa: BLE001 - optional specialization
+                    log.warning(
+                        "fast engine unavailable; using the stock step: %s", exc
+                    )
+                    self._fast_engine = None
 
             system = self._system
             self._sampler = system._sampler
@@ -1046,6 +1094,7 @@ class MRTEngine:
         self._system = None
         self._fast = False
         self._fast_sampling = False
+        self._fast_engine = None
         self._active_streams = 1
         with self._cost_lock:
             self._costs.clear()

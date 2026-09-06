@@ -71,6 +71,13 @@ export interface PetFrame {
   blink: boolean
   // 0..1, how hard the music is hitting right now
   bob: number
+  // 0..1, how far the music is above its own running level right now: the
+  // beat as a beat, rather than as loudness. `bob` rides a pedestal - its
+  // release is slower than the gap between kicks, so it never returns to
+  // zero in a busy mix - and anything meant to LAND on the rhythm needs the
+  // pedestal subtracted, or the gesture shrinks to whatever sliver of range
+  // the mix leaves over.
+  pulse: number
   // 0..1, celebration hop - lifts the whole loaf off the ground
   hop: number
   // 0..1, ear flick when something lands. continuous, not a switch: an ear
@@ -81,14 +88,24 @@ export interface PetFrame {
   // which is what a cat does when you pat it - a hop would be what a cat does
   // when you drop something.
   pat: number
-  // continuously rising phase in seconds, for the tail, breath and floaters
+  // continuously rising phase in seconds, for the head rock, breath and floaters
   phase: number
+  // the tail's own phase, in radians, integrated by the caller. the tail
+  // swings faster the louder the music, and a swing speed that changes per
+  // frame only stays continuous if the phase it feeds accumulates -
+  // multiplying the running clock by this frame's tempo rewinds or fast-
+  // forwards the sine by whole turns every time the tempo moves, and the tail
+  // teleports. see the tail note in poseBody.
+  swing: number
+  // the breath, likewise integrated by the caller: sleep breathes slower, and
+  // switching the rate on a raw clock would pop the ribs to a random point in
+  // the cycle at the moment of dozing off
+  breathe: number
   // the music is playing: notes, a busier tail, a head that keeps time
   notes: boolean
   // 0..1, how far into the music the cat is. `notes` is the switch, this is
-  // the ramp behind it: the bop lifts the loaf off the ground between beats,
-  // and a lift that appeared the frame the first note landed would be a jump
-  // rather than a cat settling into the groove.
+  // the ramp behind it: the head's rock and nod ride it, so the cat eases
+  // into keeping time instead of snapping to it on the first note.
   groove: number
   // 0..1, celebration sparkles fading out
   sparkle: number
@@ -104,10 +121,13 @@ export const IDLE_FRAME: PetFrame = {
   mood: "idle",
   blink: false,
   bob: 0,
+  pulse: 0,
   hop: 0,
   twitch: 0,
   pat: 0,
   phase: 0,
+  swing: 0,
+  breathe: 0,
   notes: false,
   groove: 0,
   sparkle: 0,
@@ -197,6 +217,25 @@ const SPARKLE_SPOTS: Array<[number, number]> = [
   [1, 17],
 ]
 
+// hearts in flight: when each was born and which column it climbs. they used
+// to be gated frame by frame on the affection level, which snuffed a heart
+// mid-air the instant the cooling level dropped under its height - and the
+// sawtooth respawned it at the bottom a moment later, so a cursor leaving
+// the cat strobed hearts instead of letting them drift off. a heart now
+// spawns only while the affection is warm, and once born it always finishes
+// its flight, dimming as it climbs. the column is fixed at birth so a heart
+// rises straight while the head sways under it.
+interface HeartFlight {
+  born: number
+  col: number
+  row: number
+}
+const HEARTS: HeartFlight[] = []
+const HEART_FLIGHT_S = 1.3
+const HEART_GAP_S = 0.55
+let lastHeartBorn = -1
+let heartSide = 0
+
 // one grid and one field, re-struck every frame. the caller paints from the
 // grid immediately and never keeps it, so handing out the same buffers saves
 // two allocations a frame - a small thing thirty times a second is not a small
@@ -204,6 +243,21 @@ const SPARKLE_SPOTS: Array<[number, number]> = [
 const SCRATCH: Grid = new Uint8Array(PET_W * PET_H)
 const FIELD = new Float32Array(PET_W * PET_H)
 const BLOBS = new BlobSet()
+
+// how much ink each cell holds, 0..1, alongside the grid of shades. the cat is
+// drawn as liquid rather than as dots (see lib/ink-render), and this is what
+// tells a cell how far to swell: cells deep inside the body are saturated and
+// overlap their neighbours into one mass, cells out at the edge of the field
+// are partial and bead.
+//
+// it is taken from the same field the silhouette is cut from, so the ink
+// thickens exactly where the cat is thick. anything struck on afterwards - a
+// marking, a note, a heart - has no field under it and keeps the flat value
+// below, which is what keeps the small crisp marks crisp while the body flows.
+export const INK = new Float32Array(PET_W * PET_H)
+const INK_FLAT = 0.62
+// where inside the surface the ink counts as saturated
+const INK_FULL = SURFACE * 2.1
 // the head on its own, kept apart from the rest so its outline can be struck
 // back over the body it is sunk into
 const HEAD_BLOBS = new BlobSet()
@@ -216,6 +270,23 @@ let headR = 4.7
 let faceWide = 1
 let baseRow = Math.round(GROUND)
 let tailFlick = 0
+
+// whole dots, with a grip. everything that carries a marking has to sit on a
+// whole dot, but Math.round moves the part the instant the continuous value
+// crosses the half-dot line - so a value breathing on that line, as the beat
+// envelope always is, drags the head back and forth a dot at frame rate,
+// and a face that vibrates reads as a fault in the panel. a settled part
+// holds its dot until the value has committed clearly past the line, and
+// then lands once. real motion - a sway, a lift, a lean - sails through the
+// threshold and is never held back by it; only the tremble is.
+const SETTLED = new Map<string, number>()
+const settle = (key: string, want: number, grip = 0.65): number => {
+  const held = SETTLED.get(key)
+  if (held !== undefined && Math.abs(want - held) < grip) return held
+  const next = Math.round(want)
+  SETTLED.set(key, next)
+  return next
+}
 
 export function drawPet(f: PetFrame): Grid {
   const g = SCRATCH
@@ -236,6 +307,19 @@ export function drawPet(f: PetFrame): Grid {
     haloAt: 0.4,
   })
 
+  // the ink, read off the field before any marking is struck on top of it. a
+  // cell just inside the surface is a bead and the belly is saturated, so the
+  // silhouette's edge flows and pools instead of stepping.
+  for (let i = 0; i < FIELD.length; i++) {
+    const v = FIELD[i]
+    if (v <= 0) {
+      INK[i] = INK_FLAT
+      continue
+    }
+    const t = Math.min(1, Math.max(0, (v - SURFACE * 0.4) / (INK_FULL - SURFACE * 0.4)))
+    INK[i] = 0.4 + 0.6 * (t * t * (3 - 2 * t))
+  }
+
   drawShadow(g, f)
   drawHeadEdge(g)
   drawMarkings(g)
@@ -252,25 +336,23 @@ function poseBody(f: PetFrame) {
   BLOBS.reset()
   HEAD_BLOBS.reset()
 
-  // squash and stretch. a beat presses the loaf down and out; a hop pulls it
-  // in and up. blobs are round, so the widening has to come from where they
+  // squash and stretch. a hop pulls the loaf in and up; a hand presses it
+  // down and out. blobs are round, so the widening has to come from where they
   // sit rather than from scaling any one of them - spreading a row of them
   // sideways widens a silhouette in a way a single circle cannot.
+  //
+  // the beat is deliberately not in here. it was, for a while, and a body
+  // that squashes twice a second is a cat on a trampoline: the whole
+  // silhouette churned and the thing read as bouncing rather than listening.
+  // the music now moves the head and the tail and nothing else - the loaf
+  // sits still, which is what a loafed cat does, and the stillness is what
+  // makes the parts that do move read.
   //
   // only the squash shortens the cat. letting a hop lengthen it as well is
   // correct animation and wrong here: it stacks with the lift and puts the ear
   // tips through the top of the panel.
-  const springy = f.hop * 0.9 - f.bob * 0.7 - f.pat * 0.6
-  // the width gets its own, much smaller, share of the beat.
-  //
-  // `wide` spreads the blobs out from the middle, so what it does to the
-  // outline depends on how far out they already sit. the number was tuned on a
-  // sitting cat whose body was four dots either side of centre, where a beat
-  // moved the outline by one; the loaf that replaced it reaches twelve, where
-  // the same number moves it by five. a cat that shortens by two and widens by
-  // one is dipping to the music. the same cat widening by five is a pancake,
-  // and that - not the shortening - is what went wrong with the bop.
-  const spread = f.hop * 0.9 - f.bob * 0.12 - f.pat * 0.6
+  const springy = f.hop * 0.9 - f.pat * 0.6
+  const spread = f.hop * 0.9 - f.pat * 0.6
   const wide = 1 - spread * (spread > 0 ? 0.18 : 0.34)
   const tall = 1 + (springy < 0 ? springy * 0.17 : 0)
   const rScale = 1 + springy * 0.05
@@ -282,26 +364,36 @@ function poseBody(f: PetFrame) {
   // the squash, the ear flick, the tail - stay continuous, because nothing is
   // struck onto them.
   //
-  // the beat is the exception, and it is the whole of the bop. a hop and a
-  // hand are events - they land on a dot and stay there for a moment, so they
-  // round. a beat is a ride: the loaf settles into the ground and comes back
-  // up twice a second, and rounding that is what turned the bop into a switch
-  // between a flat pose and a normal one. it stays continuous, and the
-  // silhouette glides even though the markings on it still land on whole dots.
+  // the lift is events only: a hop and a hand land on a dot and stay there
+  // for a moment. the music used to ride the whole loaf up off the ground
+  // between beats, and however smoothly it did so, a body that travels twice
+  // a second is a bounce - the loaf now keeps its seat and leaves the beat
+  // to the head.
+  const lift = Math.round(f.hop * 2.4 - f.pat * 0.7)
+  // the breath deepens a touch when the music is on - ribs working under a
+  // still coat is most of what keeps a motionless body from reading as a
+  // statue of itself
+  const breath = Math.sin(f.breathe) * (0.2 + f.groove * 0.12)
+  // the tail rides its own accumulated phase. it used to ride the clock times
+  // a beat-dependent rate, and the clock is minutes long: every flicker of the
+  // beat envelope spun the sine by whole turns and the tail teleported. the
+  // caller integrates the rate instead, so however hard the rate moves, the
+  // phase only ever advances - the swish speeds up and slows down without a
+  // single discontinuity.
   //
-  // and the bounce sits on top of it. between beats the loaf rides up off the
-  // ground and each beat sets it back down, rather than the other way about:
-  // the field is cut off flat along the ground, so a loaf pressed *into* it
-  // loses its bottom rows to the cut instead of moving, and what should have
-  // been a bounce came out as a spread. going up is not cut, so the whole
-  // animal travels. the small term the other way is the beat itself landing.
-  const lift = Math.round(f.hop * 2.4 - f.pat * 0.7) + f.groove * (1 - f.bob) * 1.2 - f.bob * 0.4
-  const breath = Math.sin(f.phase * (f.mood === "sleep" ? 0.7 : 1.15)) * 0.2
-  tailFlick = Math.sin(f.phase * (1.2 + f.bob * 2.6)) * (0.7 + f.bob * 1.7)
+  // two waves off the same phase, one at half speed: a single sine is a
+  // metronome, and a cat's tail is not. the slow wave wanders the curl's
+  // resting height while the fast one swishes about it, and because both are
+  // scalings of one accumulated phase they stay as continuous as it is.
+  tailFlick =
+    Math.sin(f.swing) * (0.8 + f.bob * 1.3) + Math.sin(f.swing * 0.53 + 1.1) * 0.5
 
   faceWide = wide
   const floor = GROUND - lift
-  baseRow = Math.round(floor)
+  // settled, not rounded: the flat cut along the ground, the paws and the
+  // haunch all sit on this row, and nothing that breathes through `lift`
+  // may strobe the whole base of the animal across two rows.
+  baseRow = settle("base", floor)
   const up = (d: number) => floor - (PIVOT + (d - PIVOT) * tall)
   const out = (d: number) => BODY_X + d * wide
 
@@ -310,29 +402,54 @@ function poseBody(f: PetFrame) {
   // whole head carried two dots towards the cursor reads as attention.
   const lean = f.gazeX * 2.0
   const nod = f.gazeY * 1.1
-  // keeping time. the head rocks side to side and settles into the shoulders
-  // on the beat, which is the whole of what a cat sitting in front of a
-  // speaker does about it.
+  // keeping time. the head rocks side to side and dips on the kick, and that
+  // is the whole of the cat's dancing - the body under it holds nearly still,
+  // and the stillness is what lets a one-dot nod read from across the room.
   //
-  // the amplitude never drops below a dot. below that the rounding turns a
-  // smooth sine into a coin toss - the head sits still for a while and then
-  // jumps a dot for one frame, which reads as a glitch rather than as time
-  // being kept.
-  const sway = f.notes ? Math.sin(f.phase * 2.4) * (1.0 + f.bob * 1.4) : 0
+  // ridden on `groove` rather than switched on `notes`: the ramp carries the
+  // rock in over a second or so, which is a cat picking the rhythm up, where
+  // the switch was a head teleporting a dot sideways on the first note. the
+  // beat leans on the amplitude only gently - the rock is the tempo of the
+  // whole animal and should barely notice one loud bar.
+  //
+  // and the rock is shorter to the right than to the left. the mound is on
+  // the head's right, so a full swing that way buries the cheek in the
+  // shoulder - a head that reaches into the open air and comes back reads as
+  // swaying; one that reaches into its own body reads as burrowing.
+  const rock = Math.sin(f.phase * 2.4)
+  const sway = rock * (rock > 0 ? 0.7 : 1.0) * (1.2 + f.bob * 0.6) * f.groove
+  // the nod: each kick presses the head down and the release lets it back
+  // up - this is the part of the dance that is actually on the music's
+  // rhythm, where the side-to-side rock is the cat's own slower tempo. it
+  // rides `pulse`, not `bob`: bob never returns to zero between kicks in a
+  // busy mix, and a nod driven by it sat pressed instead of nodding. the
+  // pulse is the beat with the mix subtracted, deep enough to clear the
+  // settle grip on every real kick - one visible dot down, back up between.
+  const dip = f.pulse * f.groove * 1.7
+  // the rest of the fluid motion, all of it slow and all of it continuous:
+  // the loaf leans a fraction of a dot with the music on a lazier period
+  // than the head, and the ears trail the head's rock like they have a
+  // little mass of their own. nothing here is driven by the beat envelope,
+  // so nothing here can tremble with it - the fluidity is layered fixed-rate
+  // waves, not louder reactions.
+  const drift = Math.sin(f.phase * 1.2) * 0.5 * f.groove
+  const earTrail = Math.sin(f.phase * 2.4 - 0.7) * 0.55 * f.groove
 
   // ---- the tail. only the last third of it: the rest is behind the loaf,
   // which is where a cat sitting like this keeps it. it sweeps out along the
   // ground past the flank and then curls up, and the curl is the part that
-  // moves - faster and further the louder the music.
+  // moves - faster and further the louder the music. the curl stands a clear
+  // column of unlit panel off the flank: metaballs fuse across small gaps,
+  // and a tail fused to the rump is not a tail, it is a wide cat.
   limb(
     BLOBS,
-    out(11.0),
-    up(1.4),
-    out(21.0),
+    out(12.4) + drift,
+    up(1.5),
+    out(22.0),
     up(1.0),
-    out(19.5),
-    up(8.0 + tailFlick),
-    2.0 * rScale,
+    out(20.3),
+    up(8.8 + tailFlick),
+    2.2 * rScale,
     0.85,
     8,
   )
@@ -348,15 +465,25 @@ function poseBody(f: PetFrame) {
   // from skull to base, and the one job of the geometry is that the widening
   // happens over two rows rather than over eight - a slope that gradual is a
   // tent, and a tent is not an animal.
-  const sag = Math.round(lean * 0.25)
+  const sag = settle("sag", lean * 0.25)
   headR = 5.0 * rScale
-  headX = Math.round(HEAD_X + lean + sway)
-  // no beat term here. the head rides on `up`, which carries the lift, so it
-  // already goes down and comes back with the rest of the animal - and a cat
-  // bopping moves in one piece. a beat added on top of that sinks the head
-  // into the shoulders instead, which is a cat being pressed rather than a cat
-  // keeping time, and it costs the chest the three dots it has.
-  headY = Math.round(up(14.0) + nod)
+  // settled, not rounded: the sway and the lean sail through the half-dot
+  // line and land cleanly, but the beat envelope trembling in the sway's
+  // amplitude used to dither the head - and the whole face with it - across
+  // two columns at frame rate.
+  //
+  // and capped on the right, where the mound is. the sway alone stays short
+  // of the shoulder, but the cursor's lean stacking on top of it used to
+  // carry the cheek two further dots into the body. the cap is the shoulder
+  // itself: a head turns only so far into its own animal, however
+  // interesting the thing on that side is - the pupils carry the rest of a
+  // rightward look.
+  headX = settle("headX", Math.min(HEAD_X + 1.35, HEAD_X + lean + sway))
+  // the beat lands here, and only here: the body is still, so the head
+  // keeping time has to carry the beat itself. it is small on purpose - one
+  // settled dot on a strong kick, back up between kicks - because a head
+  // that ploughs into the chest is a cat being pressed, not a cat nodding.
+  headY = settle("headY", up(15.2) + nod + dip)
   const skull = 2.2 * wide + (f.mood === "happy" || f.mood === "cheer" ? 0.4 : 0)
   head(headX - skull, headY, headR)
   head(headX, headY, headR * 1.02)
@@ -373,23 +500,28 @@ function poseBody(f: PetFrame) {
   // it, rising to the haunch, dropping away again at the tail end. a level
   // back is a bench; this one is the line that says which end the cat keeps
   // its legs under.
+  //
+  // the mound is deliberately big. the head is drawn large so the face can
+  // carry the expression, and on a low, narrow loaf it read as a mascot
+  // head on a beanbag - the body needs real mass under it before the two
+  // look like one animal.
   const back: Array<[number, number]> = [
-    [-11.0, 7.8],
-    [-7.0, 8.8],
-    [-3.0, 9.2],
-    [1.0, 9.3],
-    [5.0, 9.3],
-    [9.0, 9.0],
-    [12.0, 8.2],
+    [-12.0, 8.6],
+    [-8.0, 9.9],
+    [-4.0, 10.6],
+    [0.0, 10.9],
+    [4.0, 10.9],
+    [8.5, 10.4],
+    [13.0, 9.2],
   ]
-  for (const [d, h] of back) BLOBS.add(out(d) + sag, up(h), (3.5 + breath) * rScale)
+  for (const [d, h] of back) BLOBS.add(out(d) + sag + drift, up(h), (3.8 + breath) * rScale)
   // flanks and base stay square to the ground: a cat settled like this is
   // level underneath whatever its back is doing
-  for (const d of [-12.0, -8.0, -4.0, 0, 4.0, 8.0, 12.0]) {
-    BLOBS.add(out(d) + sag, up(4.5), 3.6 * rScale)
+  for (const d of [-13.0, -8.7, -4.3, 0, 4.3, 8.7, 13.0]) {
+    BLOBS.add(out(d) + sag + drift, up(5.0), 3.9 * rScale)
   }
-  for (const d of [-11.8, -8.0, -4.0, 0, 4.0, 8.0, 11.8]) {
-    BLOBS.add(out(d) + sag, up(1.0), 3.6 * rScale)
+  for (const d of [-12.8, -8.6, -4.3, 0, 4.3, 8.6, 12.8]) {
+    BLOBS.add(out(d) + sag + drift, up(1.0), 3.9 * rScale)
   }
 
   // ---- ears. how far they are pricked is more of the cat's mood at a glance
@@ -407,8 +539,8 @@ function poseBody(f: PetFrame) {
             : f.affection * 0.5
   // a hand on the head folds them back whatever the mood says
   const perk = mooded - f.pat * 1.0
-  ear(-1, perk, skull, wide, tall, rScale, f.twitch * 0.5)
-  ear(1, perk, skull, wide, tall, rScale, f.twitch)
+  ear(-1, perk, skull, wide, tall, rScale, f.twitch * 0.5, earTrail)
+  ear(1, perk, skull, wide, tall, rScale, f.twitch, earTrail)
 }
 
 // a part of the head: into the whole cat, and again into the head on its own
@@ -418,6 +550,9 @@ const head = (x: number, y: number, r: number) => {
 }
 
 // one ear, grown out of the skull as a tapering chain. side is -1 or 1.
+// `trail` drags both tips the same way in panel space, a beat behind the
+// head's rock - ears with a little inertia of their own are the difference
+// between a swaying cat and a swaying cardboard cutout.
 function ear(
   side: number,
   perk: number,
@@ -426,13 +561,17 @@ function ear(
   tall: number,
   rScale: number,
   flick: number,
+  trail = 0,
 ) {
   // drooping swings the tip out and down; perking stands it up and draws it in
   // the tips splay out to about the width of the skull whatever the mood is
   // doing to them. pulled in much further than that they leave a step at the
   // crown, and the head reads as a dome with two small horns on it.
   const spread = 3.2 - perk * 0.5 + flick * 0.9
-  const height = (7.0 + perk * 0.8 - flick * 1.4) * tall
+  // a touch shorter than they were: the head now rides a taller mound, and
+  // the old height put the tips through the top of the panel on a full hop.
+  // shorter ears also read younger, which suits the thing.
+  const height = (6.4 + perk * 0.8 - flick * 1.4) * tall
   const baseX = headX + side * (skullHalf + headR * 0.48)
   const baseY = headY - headR * 0.55
   // into both sets: the ears are part of the head, and an outline taken from a
@@ -444,9 +583,9 @@ function ear(
       baseY,
       // the control point bows the outer edge, which is the difference between
       // a cat's ear and a traffic cone
-      baseX + side * spread * 0.3,
+      baseX + side * spread * 0.3 + trail * 0.5,
       baseY - height * 0.6,
-      baseX + side * spread * wide,
+      baseX + side * spread * wide + trail,
       baseY - height,
       2.7 * rScale,
       0.55,
@@ -514,7 +653,7 @@ const shade = (g: Grid, r: number, c: number) => onFur(g, r, c, DIM)
 // has jumped.
 function drawShadow(g: Grid, f: PetFrame) {
   const r = Math.round(GROUND) + 1
-  const half = Math.round(15 - f.hop * 6)
+  const half = Math.round(17 - f.hop * 6)
   const mid = Math.round(BODY_X)
   for (let c = mid - half; c <= mid + half; c++) {
     // thinned at the ends, so it reads as a pool rather than as a plank
@@ -526,7 +665,6 @@ function drawShadow(g: Grid, f: PetFrame) {
 // markings struck onto the silhouette once it is shaded
 // ---------------------------------------------------------------------------
 function drawMarkings(g: Grid) {
-  const hr = Math.round(headY)
   const hc = Math.round(headX)
 
   // inner ears, a shade back from the fur round them. `onFur` keeps them on
@@ -543,17 +681,27 @@ function drawMarkings(g: Grid) {
   // laid right along the jawline, where it was doing the separating; now that
   // the head carries its own outline the collar is free to be what it is, and
   // two bands stacked on the same three rows only read as one thick one.
-  const collar = hr + 9
-  overRow(g, collar, hc - 6, hc + 6, ACCENT)
-  onFur(g, collar + 1, hc, HOT)
+  //
+  // anchored to the body for its seat - a collar that slid around the chest
+  // with every sway read as loose skin - but it yields downward under the
+  // chin: the nod presses the head into the chest, and a band that stayed
+  // put had the chin poking out underneath it on every strong kick. the max
+  // is the deeper of its body seat and one rank clear of the jaw, so the
+  // head can never pass through it, only push it.
+  const chestX = Math.round(HEAD_X)
+  const hr = Math.round(headY)
+  const collar = Math.max(baseRow - 6, hr + 9)
+  overRow(g, collar, chestX - 6, chestX + 6, ACCENT)
+  onFur(g, collar + 1, chestX, HOT)
 
   // ---- the two front paws, tucked under the front of the loaf. they are the
   // detail that says loaf rather than lump: a cat sitting like this has its
   // paws folded away with just the toes out in front.
   // one clear of the base line: that bottom row is all rim, and a pale paw
-  // struck onto the rim is a paw you cannot see
+  // struck onto the rim is a paw you cannot see. on the body's anchor for the
+  // same reason as the collar: paws do not follow a nodding head.
   const pr = baseRow - 2
-  const pawX = hc + 1
+  const pawX = chestX + 1
   for (const side of [-1, 1]) {
     const near = pawX + side * 2
     const far = pawX + side * 6
@@ -570,11 +718,11 @@ function drawMarkings(g: Grid) {
   // one line and it does more for the read than anything else on the body -
   // without it the back half is a featureless slab, and a cat is an animal
   // whose back half you can see the mechanics of even when it is asleep.
-  const hx = Math.round(BODY_X) + 12
+  const hx = Math.round(BODY_X) + 13
   const hy = baseRow + 1
-  for (let i = 0; i <= 14; i++) {
-    const a = (i / 14) * (Math.PI / 2)
-    onFur(g, Math.round(hy - Math.sin(a) * 7.6), Math.round(hx - Math.cos(a) * 9), MID_SHADE)
+  for (let i = 0; i <= 16; i++) {
+    const a = (i / 16) * (Math.PI / 2)
+    onFur(g, Math.round(hy - Math.sin(a) * 8.8), Math.round(hx - Math.cos(a) * 10), MID_SHADE)
   }
 
   // the chest bib that used to run from the collar down to the paws is gone.
@@ -590,7 +738,10 @@ function drawFace(g: Grid, f: PetFrame) {
 
   // how far the lids have come down. the eyes are the loudest thing on the
   // panel, so most of the difference between one mood and the next is here.
-  const lid = f.mood === "focus" ? 2 : f.mood === "bop" ? 1 : 0
+  // bopping keeps them all the way open: half-lidded eyes at four dots tall
+  // read as a glower, and a cat enjoying the music should look delighted to
+  // be here, not sceptical of it.
+  const lid = f.mood === "focus" ? 2 : 0
 
   for (const side of [-1, 1]) {
     // the socket runs from three to six dots out. four across is the width
@@ -622,18 +773,26 @@ function drawFace(g: Grid, f: PetFrame) {
       // LED panel and on warm paper - whichever way the theme runs, the thing
       // that moves is the thing you look at.
       furBox(g, top, lo, bottom, hi, OFF)
-      // the pupil is three dots across inside a socket five across, so it has
-      // a dot of travel each way - enough to read as a look when the head is
-      // already leaning that way, and never enough to fall out of the eye
+      // a two-by-two pupil floating in the middle of the socket, not a bar
+      // filling it: the clear dark ring around the pupil is what makes the
+      // eye look big and round, and big round eyes are most of what cute
+      // means at this scale. it has a dot of travel each way - enough to
+      // read as a look when the head is already leaning that way, and never
+      // enough to fall out of the eye.
       const px = Math.round(f.gazeX * 1.1)
-      const py = Math.max(top - bottom + 1, Math.min(0, Math.round(f.gazeY * 0.9)))
-      if (lid < 2) row(g, bottom - 2 + py, lo + 1 + px, lo + 2 + px, HOT)
-      row(g, bottom - 1 + py, lo + 1 + px, lo + 2 + px, HOT)
-      row(g, bottom + py, lo + 1 + px, lo + 2 + px, HOT)
-      // the glint, in whichever corner of the socket the pupil has left empty
-      // ...and mirrored, so the light is coming from one place rather than
-      // from wherever the maths happened to put it
-      if (lid < 2) at(g, top, px * side > 0 ? inner : outer, HOT)
+      const py = Math.max(-1, Math.min(bottom - top - 2, Math.round(f.gazeY * 0.9)))
+      // narrowed lids leave a two-row socket, and the pupil fills it; open
+      // eyes centre the pupil with a clear ring around it
+      const pTop = lid < 2 ? top + 1 + py : top
+      row(g, pTop, lo + 1 + px, lo + 2 + px, HOT)
+      row(g, pTop + 1, lo + 1 + px, lo + 2 + px, HOT)
+      // the catchlight, one dot diagonally off the pupil's upper inner
+      // corner. inner on both sides, so the two eyes wear matching sparkles
+      // toward the nose - the pair is what reads as glossy rather than as a
+      // stray lit dot.
+      if (lid < 2 && pTop - 1 >= top) {
+        at(g, pTop - 1, side === -1 ? Math.min(hi, lo + 3 + px) : Math.max(lo, lo + px), HOT)
+      }
     }
   }
 
@@ -660,8 +819,10 @@ function drawFace(g: Grid, f: PetFrame) {
     furRow(g, my + 2, Math.min(far, near), Math.max(far, near), DIM)
   }
 
-  // the flush of being noticed, warm on the cheeks under the eyes
-  if (f.affection > 0.4 || beaming) {
+  // the flush of being noticed, warm on the cheeks under the eyes - and worn
+  // whenever the music is playing too, which is what makes the bop read as a
+  // cat enjoying itself rather than merely metronoming
+  if (f.affection > 0.4 || beaming || f.mood === "bop") {
     for (const side of [-1, 1]) {
       onFur(g, hr, hc + side * 6, MID_SHADE)
       onFur(g, hr, hc + side * 7, MID_SHADE)
@@ -679,25 +840,52 @@ function drawFloaters(g: Grid, f: PetFrame) {
     const shown = Math.ceil(f.sparkle * SPARKLE_SPOTS.length)
     for (let i = 0; i < shown; i++) {
       const [r, c] = SPARKLE_SPOTS[i]
-      if (Math.sin(f.phase * 6 + i * 1.9) > -0.5) star(g, r, c, HOT)
+      // the twinkle is a change of brightness, not of existence: a star that
+      // blinks off and on again reads as a fault in the panel, where one that
+      // breathes between bright and dim reads as glitter
+      star(g, r, c, Math.sin(f.phase * 6 + i * 1.9) > -0.2 ? HOT : DIM)
     }
   }
 
   if (f.notes && f.mood !== "sleep") {
+    // launched from beside the resting head, then owned by the air: a floater
+    // that keeps referring back to a nodding, swaying head gets carried a dot
+    // sideways or down every time the head moves, and every floater on the
+    // panel twitching in step with the nod reads as the panel glitching, not
+    // as the cat enjoying itself.
     for (let i = 0; i < 2; i++) {
       const rise = (f.phase * 0.7 + i * 0.5) % 1
-      const r = Math.round(hr - 5 - rise * 7)
-      const c = hc + 10 + i * 4 + Math.round(Math.sin(rise * 4 + i) * 1.5)
-      note(g, r, c, rise > 0.8 ? DIM : LIT)
+      const r = Math.round(8 - rise * 7)
+      const c = HEAD_X + 10 + i * 4 + Math.round(Math.sin(rise * 4 + i) * 1.5)
+      // three shades on the way up, so a note dissolves rather than snapping
+      // from lit to gone at the top of its climb
+      note(g, r, c, rise > 0.88 ? FAINT : rise > 0.68 ? DIM : LIT)
     }
   }
 
-  if (f.affection > 0) {
-    for (let i = 0; i < 2; i++) {
-      const rise = (f.phase * 1.1 + i * 0.5) % 1
-      if (rise > f.affection) continue
-      heart(g, Math.round(hr - 7 - rise * 5), hc - 12 - i * 3, rise > 0.7 ? DIM : ACCENT)
-    }
+  // hearts: spawn while the affection is warm, then always finish the flight
+  for (let i = HEARTS.length - 1; i >= 0; i--) {
+    if (f.phase - HEARTS[i].born > HEART_FLIGHT_S) HEARTS.splice(i, 1)
+  }
+  if (f.affection > 0.5 && HEARTS.length < 2 && f.phase - lastHeartBorn > HEART_GAP_S) {
+    HEARTS.push({
+      born: f.phase,
+      // two fixed lanes beside the resting head, far enough apart that two
+      // hearts in flight never share a dot - overlapping flights repainting
+      // each other's pixels was its own small flicker
+      col: HEAD_X - (heartSide++ % 2 === 0 ? 13 : 8),
+      row: hr - 6,
+    })
+    lastHeartBorn = f.phase
+  }
+  for (const h of HEARTS) {
+    const rise = (f.phase - h.born) / HEART_FLIGHT_S
+    heart(
+      g,
+      Math.round(h.row - rise * 6),
+      h.col,
+      rise > 0.8 ? FAINT : rise > 0.55 ? DIM : ACCENT,
+    )
   }
 
   if (f.mood === "sleep") {
