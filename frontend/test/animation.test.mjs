@@ -22,7 +22,7 @@ function load(name, globals = {}) {
   return module.exports
 }
 
-const { BlobSet, surfaceDistance } = load("dot-field")
+const { BlobSet, SURFACE, surfaceDistance } = load("dot-field")
 {
   const blobs = new BlobSet()
   blobs.add(-3.2, 7.1, 5.4)
@@ -45,6 +45,39 @@ const { BlobSet, surfaceDistance } = load("dot-field")
   assert.ok(Number.isFinite(surfaceDistance(empty, 0, 4)))
   assert.ok(Number.isFinite(surfaceDistance(new Float32Array(1), 0, 1)))
   console.log("PASS  bounded scattering matches point sampling at arbitrary pitch and origin")
+}
+
+{
+  const blobs = new BlobSet()
+  blobs.add(-3.2, 7.1, 5.4)
+  blobs.add(9.6, 4.2, 3.7, -0.4)
+  blobs.add(11.5, -2.6, 4.1, 0.7)
+  const epsilon = 0.0001
+  for (const pitch of [0.7, 1, 6.3, 18]) {
+    for (let angle = 0; angle < Math.PI * 2; angle += 0.07) {
+      const x = Math.cos(angle) * 9, y = Math.sin(angle) * 9
+      const dx = (blobs.at(x + epsilon, y) - blobs.at(x - epsilon, y)) / (2 * epsilon)
+      const dy = (blobs.at(x, y + epsilon) - blobs.at(x, y - epsilon)) / (2 * epsilon)
+      const expected = (blobs.at(x, y) - SURFACE) / Math.max(0.025, Math.hypot(dx, dy) * pitch)
+      assert.ok(Math.abs(blobs.surfaceDistanceAt(x, y, pitch) - expected) < 1e-6,
+        "radial edge distance must follow the continuous field gradient")
+    }
+  }
+  blobs.reset()
+  blobs.add(0, 0, 10)
+  for (const radius of [0, 9.99, 10, 10.01, 25]) {
+    const expected = blobs.surfaceDistanceAt(radius, 0, 2)
+    assert.ok(Number.isFinite(expected))
+    for (let angle = 0; angle < Math.PI * 2; angle += 0.07) {
+      assert.ok(Math.abs(blobs.surfaceDistanceAt(Math.cos(angle) * radius,
+        Math.sin(angle) * radius, 2) - expected) < 1e-10,
+      "a circular surface must have the same soft edge at every angle")
+    }
+  }
+  assert.ok(blobs.surfaceDistanceAt(9.99, 0) > 0)
+  assert.ok(Math.abs(blobs.surfaceDistanceAt(10, 0)) < 1e-10)
+  assert.ok(blobs.surfaceDistanceAt(10.01, 0) < 0)
+  console.log("PASS  radial field sampling stays continuous, rotation invariant, and finite")
 }
 
 const pet = load("pet-scene")

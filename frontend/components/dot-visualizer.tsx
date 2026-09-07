@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, type ReactNode } from "react"
 import { canvasLoop } from "@/lib/canvas-loop"
-import { BlobSet, smoothstep, surfaceDistance } from "@/lib/dot-field"
+import { BlobSet, smoothstep } from "@/lib/dot-field"
 import { LiquidInk } from "@/lib/liquid-ink"
 import { buildWave, SPOKES, WAVE_BODY, WAVE_CREST, WAVE_GLOW } from "@/lib/wave-scene"
 
@@ -59,9 +59,7 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
     const velocity = new Float32Array(SPOKES)
     let loudCeil = 0
 
-    let size = 0, dpr = 0, pitch = 1, inner = 0, gridSize = 0, origin = 0
-    let field = new Float32Array(0)
-    let sampleIndex = new Int32Array(0)
+    let size = 0, dpr = 0, pitch = 1, inner = 0
     let distance = new Float32Array(0)
     let ink: { count: number; x: Float32Array; y: Float32Array; fill: Float32Array }
     let skirt: LiquidInk, body: LiquidInk, crest: LiquidInk
@@ -82,25 +80,20 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
       const mid = size / 2
       inner = mid * INNER
       pitch = (mid * OUTER - inner) / (RINGS - 1)
-      gridSize = (Math.floor(size / pitch) - 1) | 1
-      origin = -(gridSize - 1) * pitch / 2
-      const hole = inner - pitch * 0.55
-      const rim = mid * OUTER + pitch * 0.75
-      const xs: number[] = [], ys: number[] = [], indices: number[] = []
-      for (let gy = 0; gy < gridSize; gy++) {
-        for (let gx = 0; gx < gridSize; gx++) {
-          const x = origin + gx * pitch, y = origin + gy * pitch
-          const d = Math.hypot(x, y)
-          if (d < hole || d > rim) continue
-          xs.push(x)
-          ys.push(y)
-          indices.push(gy * gridSize + gx)
+      const xs: number[] = [], ys: number[] = []
+      for (let ring = 0; ring < RINGS; ring++) {
+        const radius = inner + ring * pitch
+        // Add beads with circumference so spacing stays near one pitch.
+        // Multiples of four keep each ring symmetric about both axes.
+        const dots = Math.round(Math.PI * 2 * radius / pitch / 4) * 4
+        for (let dot = 0; dot < dots; dot++) {
+          const angle = dot / dots * Math.PI * 2 - Math.PI / 2
+          xs.push(Math.cos(angle) * radius)
+          ys.push(Math.sin(angle) * radius)
         }
       }
       const count = xs.length
-      sampleIndex = Int32Array.from(indices)
       distance = new Float32Array(count)
-      field = new Float32Array(gridSize * gridSize)
       ink = {
         count, x: Float32Array.from(xs), y: Float32Array.from(ys),
         fill: new Float32Array(count),
@@ -152,10 +145,11 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
         velocity[s] = resting ? 0 : (velocity[s] - omega * step) * decay
       }
       buildWave(blobs, amp, { inner, span: size * OUTER / 2 - inner, pitch })
-      // Scatter each blob only over its support, instead of asking every dot
-      // about every blob. The hole remains absent from the drawing lattice.
-      blobs.scatter(field, gridSize, gridSize, pitch, origin, origin)
-      for (let i = 0; i < ink.count; i++) distance[i] = surfaceDistance(field, sampleIndex[i], gridSize)
+      // Sample the field and its gradient at the actual radial bead positions.
+      // No square-grid snapping as the surface flows between concentric rings.
+      for (let i = 0; i < ink.count; i++) {
+        distance[i] = blobs.surfaceDistanceAt(ink.x[i], ink.y[i], pitch)
+      }
 
       ctx.clearRect(0, 0, size, size)
       ctx.save()
@@ -165,7 +159,7 @@ export function DotVisualizer({ getSpectrum, active, children }: DotVisualizerPr
       skirt.paint(ctx, fill, palette[WAVE_GLOW], resting ? 0 : dt)
       for (let i = 0; i < ink.count; i++) fill[i] = smoothstep(-0.9, 0.15, distance[i])
       body.paint(ctx, fill, palette[WAVE_BODY], resting ? 0 : dt)
-      // A continuous one-cell crest. As it crosses the grid, the next bead
+      // A continuous one-cell crest. As it crosses a ring, the next bead
       // swells while the previous one recedes, with no binary edge mask.
       for (let i = 0; i < ink.count; i++) {
         const d = distance[i]

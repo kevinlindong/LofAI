@@ -27,13 +27,25 @@ See [the streaming design note](docs/MUSIC_STREAMING.md) for the full MRT2 pipel
 
 ## The Interface:
 
-The whole page is a dot matrix display, set in a real 5x7 dot matrix face. Dark is an LED sign; light is a printout, ink struck onto paper. Both themes drive the same eight-step dot ramp (`--dot-0` to `--dot-7`), which is what the two canvases paint with.
+Five separate designs are available at the numbered routes. `/` and `/1` keep the original interface; its Menu also links to all five spaces.
+
+| Route | Design | Listening experience |
+|---|---|---|
+| `/1` | Original | The existing radio, cat, tasks, timer, and color themes |
+| `/2` | Sunday | An editorial listening room with paper textures, serif type, and illustrated station sleeves |
+| `/3` | Form | A Swiss-inspired workspace with quick listening presets and a prominent focus timer |
+| `/4` | Signal | A tactile stereo receiver with station memory keys and an illuminated frequency display |
+| `/5` | Afterglow | An immersive night player with a compact mixer and a workspace drawer |
+
+The new designs reuse the dot-matrix visualizer, animated cat, task list, timer, and audio engine. Their **Make it yours** panel provides three color stories per design, saved station/drum/volume mixes, workspace visibility settings, and a sleep timer. Preferences and saved mixes stay in this browser. Using the in-app design links keeps the current audio connection and mix running; tasks also persist between visits. Keyboard shortcuts are **Space** for play/pause, **M** for mute, and **N** for a new take, outside interactive controls. The bundled Instrument Serif and Manrope fonts include their OFL licenses in `frontend/public/fonts`.
+
+All five designs keep the dot-matrix artwork and a real 5x7 dot matrix face for the ambient marks. The original interface has six color themes; the new designs each have three color stories. Every palette drives the same eight-step dot ramp (`--dot-0` to `--dot-7`), which is what the two canvases paint with.
 
 The visualizer and cat draw **liquid ink on a dot matrix**. Each cell contributes to a shared density field: droplets deform before contact, their necks widen, and the gaps between cells gradually fill. Ink enters and leaves cells over time, with a slightly longer release. The surface renderer in `frontend/lib/liquid-ink.ts` fits curves to the field and its gradients on a small, fixed grid, reuses its buffers, and paints only the contours. The cursor trail and crisp cat markings use `frontend/lib/ink-render.ts`.
 
-- The **visualizer** is a ring whose frequency bands pull on their neighbors through damped motion. A soft skirt, continuous body, and small bright crest move across the fixed square lattice. The crest fades between cells instead of switching at a hard threshold; the center stays clear for the transport button.
+- The **visualizer** is a ring whose frequency bands pull on their neighbors through damped motion. A soft skirt, continuous body, and small bright crest move across eleven concentric rings of dots, with more dots on each outer ring to keep their spacing even. The field and its gradient are sampled at each dot's radial position, so the crest fades smoothly between rings; the center stays clear for the transport button.
 - The **cat** blinks, follows the cursor, nods to the music, reacts to tasks and petting, and dozes when left alone. Its coat flows underneath separate outlines and markings, so changes of shade leave no cracks. The head, face, paws, and collar carry fractional motion through the grid, and hops and pats ease in and out. Its unlit panel dots are cached until the size or theme changes. The artwork lives in `frontend/lib/pet-scene.ts`.
-- The **background** uses a few large ASCII marks drifting on CSS keyframes and leaning toward the cursor, plus a short liquid ink trail. Both the trail and visualizer scatter each blob only over the grid cells it can reach, using reusable buffers. The trail stops drawing when it dries. ENDLESS is not redistributable here: optionally place a woff2 build at `frontend/public/fonts/endless.woff2` ([source](https://www.behance.net/gallery/247864363/ENDLESS-Geometric-Sans-Serif-Free-Font)); otherwise the marks use the monospace fallback.
+- The **background** uses a few large ASCII marks drifting on CSS keyframes and leaning toward the cursor, plus a short liquid ink trail. The trail scatters each blob only over the grid cells it can reach, using reusable buffers, and stops drawing when it dries. ENDLESS is not redistributable here: optionally place a woff2 build at `frontend/public/fonts/endless.woff2` ([source](https://www.behance.net/gallery/247864363/ENDLESS-Geometric-Sans-Serif-Free-Font)); otherwise the marks use the monospace fallback.
 - Animation painting is capped at 60fps. The visualizer and cat stop when offscreen or the tab is hidden; the trail clears when the tab is hidden. Theme and size changes repaint correctly, including while reduced motion is enabled. Changes to `prefers-reduced-motion` take effect immediately.
 
 `cd frontend && npm test` checks connector geometry, liquid merging and release, round droplets, bounded field sampling, continuous cat motion, and animation lifecycle behavior alongside the audio tests.

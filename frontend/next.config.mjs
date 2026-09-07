@@ -1,4 +1,6 @@
 export default {
+  // Separate preview builds can run alongside the listening server.
+  distDir: process.env.LOFAI_NEXT_DIST_DIR || '.next',
   reactStrictMode: true,
   async rewrites() {
     return [

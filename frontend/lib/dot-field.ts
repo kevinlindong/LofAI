@@ -89,6 +89,28 @@ export class BlobSet {
     return sum
   }
 
+  // Signed distance in pitch units for dots at arbitrary positions. The
+  // analytic gradient keeps radial layouts smooth and independent of any
+  // square sampling grid, with the same soft-edge scale as surfaceDistance.
+  surfaceDistanceAt(x: number, y: number, pitch = 1): number {
+    const d = this.data
+    const end = this.count * 4
+    let sum = 0, gradientX = 0, gradientY = 0
+    for (let i = 0; i < end; i += 4) {
+      const dx = x - d[i], dy = y - d[i + 1]
+      const r2 = d[i + 2] * d[i + 2]
+      const q = dx * dx + dy * dy
+      if (q >= r2) continue
+      const t = 1 - q / r2
+      const strength = d[i + 3] * t * t
+      const slope = -6 * strength / r2
+      sum += strength * t
+      gradientX += slope * dx
+      gradientY += slope * dy
+    }
+    return (sum - SURFACE) / Math.max(0.025, Math.hypot(gradientX, gradientY) * pitch)
+  }
+
   // sum the blobs into a w×h grid, each one touching only the cells it reaches.
   // scattering by bounding box rather than asking every cell about every blob
   // is the difference between a creature costing tens of thousands of distance
