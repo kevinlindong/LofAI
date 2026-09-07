@@ -37,6 +37,7 @@ function loadStream(addModule, initialStorage = {}) {
   const gains = []
   const analysers = []
   const compressors = []
+  const sources = []
   const timers = new Map()
   const intervals = new Map()
   const storage = new Map(Object.entries(initialStorage))
@@ -97,10 +98,6 @@ function loadStream(addModule, initialStorage = {}) {
     getByteFrequencyData(out) {
       out.fill(0)
     }
-    getFloatTimeDomainData(out) {
-      // A stable -26 dBFS-ish sine-sized signal for normalizer tests.
-      out.fill(0.05)
-    }
   }
 
   class Compressor extends Node {
@@ -133,6 +130,17 @@ function loadStream(addModule, initialStorage = {}) {
     }
     createDynamicsCompressor() {
       return new Compressor()
+    }
+    createBuffer(channels, frames, sampleRate) {
+      const data = Array.from({ length: channels }, () => new Float32Array(frames))
+      return { duration: frames / sampleRate, getChannelData: (channel) => data[channel] }
+    }
+    createBufferSource() {
+      const source = new Node()
+      source.start = (at) => { source.startedAt = at }
+      source.stop = () => { source.stopped = true }
+      sources.push(source)
+      return source
     }
     resume() {
       this.state = "running"
@@ -238,6 +246,7 @@ function loadStream(addModule, initialStorage = {}) {
     gains,
     analysers,
     compressors,
+    sources,
     timers,
     intervals,
     storage,
@@ -409,7 +418,7 @@ await test("stale session IDs are not replayed and a stale server echo requests 
   await stream.destroy()
 })
 
-await test("mastering raises quiet material slowly and keeps volume after the limiter", async () => {
+await test("mastering keeps a fixed noise floor and volume after the limiter without polling", async () => {
   const runtime = loadStream(() => Promise.resolve())
   const stream = new runtime.MrtStream(() => {})
   const starting = stream.start(CONTROLS)
@@ -426,49 +435,182 @@ await test("mastering raises quiet material slowly and keeps volume after the li
   assert.equal(limiter.attack.value, 0.003)
   assert.equal(limiter.release.value, 0.3)
 
-  // input meter -> slow gain -> limiter -> -1 dB ceiling -> user volume -> output meter
-  assert.equal(runtime.analysers[0].connections[0], runtime.gains[0])
+  // worklet -> fixed makeup -> limiter -> -1 dB ceiling -> volume -> output meter
+  assert.equal(runtime.worklets[0].connections[0], runtime.gains[0])
   assert.equal(runtime.gains[0].connections[0], limiter)
   assert.equal(limiter.connections[0], runtime.gains[1])
   assert.equal(runtime.gains[1].connections[0], runtime.gains[2])
-  assert.equal(runtime.gains[2].connections[0], runtime.analysers[1])
+  assert.equal(runtime.gains[2].connections[0], runtime.analysers[0])
   assert.ok(Math.abs(runtime.gains[1].gain.value - 10 ** (-1 / 20)) < 1e-9)
+  assert.equal(runtime.analysers.length, 1, "unused input meter still consumes audio resources")
+  assert.equal(runtime.intervals.size, 0, "mastering still polls the music's loudness")
 
   socket.onmessage({
     data: JSON.stringify({ type: "status", state: "active", realtimeFactor: 1.2 }),
   })
-  // The codec's -6 dB headroom is undone by a fixed makeup stage immediately;
-  // only the small station trim converges over time.
+  // The codec's headroom receives fixed makeup immediately. Playback never
+  // increases it in response to a quiet passage or a long-running session.
   assert.ok(
     Math.abs(runtime.gains[0].gain.value - 10 ** (5 / 20)) < 1e-9,
     "fixed makeup gain was not applied from the start",
   )
-  const loudnessTick = [...runtime.intervals.values()][0].fn
-  loudnessTick()
-  loudnessTick()
-  loudnessTick()
-  assert.ok(
-    runtime.gains[0].gain.value > 10 ** (5 / 20),
-    "quiet material did not receive a slow upward trim",
-  )
-  assert.ok(
-    runtime.gains[0].gain.value < 10 ** (5.7 / 20),
-    "normalizer trim moved faster than its rate limit",
-  )
-  // A long mellow stretch must never ratchet the gain (and with it the noise
-  // floor) beyond makeup plus the small trim bound. The pre-fix normalizer
-  // followed musical dynamics up to +9 dB, which listeners heard as a slowly
-  // rising background hiss.
-  for (let i = 0; i < 180; i++) loudnessTick()
-  assert.ok(
-    runtime.gains[0].gain.value <= 10 ** (8 / 20) + 1e-9,
-    "normalizer gain exceeded makeup plus its trim bound",
-  )
+  for (let i = 0; i < 180; i++) {
+    runtime.contexts[0].currentTime = i
+    runtime.worklets[0].port.onmessage({
+      data: { type: "state", playing: true, buffered: 1, need: 0.64 },
+    })
+  }
+  assert.equal(runtime.gains[0].gain.targets.length, 0, "playback automated the makeup gain")
+  assert.ok(Math.abs(runtime.gains[0].gain.value - 10 ** (5 / 20)) < 1e-9)
 
   stream.setVolume(0.4)
   assert.equal(runtime.gains[2].gain.value, 0.4)
   await stream.destroy()
   assert.equal(runtime.intervals.size, 0)
+})
+
+await test("small throughput updates cross reservoir boundaries without a deadband", async () => {
+  const runtime = loadStream(() => Promise.resolve())
+  const stream = new runtime.MrtStream(() => {})
+  await stream.start(CONTROLS)
+  const socket = runtime.sockets[0]
+  const worklet = runtime.worklets[0]
+  for (const [factor, prebuffer, rebuffer] of [
+    [1.203, 0.64, 0.8],
+    [1.157, 0.9, 1.0],
+    [0.995, 1.2, 1.4],
+    [1.005, 0.9, 1.0],
+    [1.185, 0.64, 0.8],
+  ]) {
+    socket.onmessage({ data: JSON.stringify({ type: "status", state: "active", realtimeFactor: factor }) })
+    const config = worklet.messages.filter((message) => message.type === "config").at(-1)
+    assert.equal(config.prebufferSeconds, prebuffer, `prebuffer missed boundary at ${factor}`)
+    assert.equal(config.rebufferSeconds, rebuffer, `rebuffer missed boundary at ${factor}`)
+    assert.equal(config.minRate, 1)
+  }
+  const configurations = worklet.messages.filter((message) => message.type === "config").length
+  for (const factor of [null, 0, -1, "1.5"]) {
+    socket.onmessage({ data: JSON.stringify({ type: "status", state: "active", realtimeFactor: factor }) })
+  }
+  assert.equal(worklet.messages.filter((message) => message.type === "config").length, configurations)
+  await stream.destroy()
+})
+
+await test("audible gaps learn bounded recovery slack that survives status and pause but resets per take", async () => {
+  const runtime = loadStream(() => Promise.resolve())
+  const stream = new runtime.MrtStream(() => {})
+  const starting = stream.start(CONTROLS)
+  const socket = runtime.sockets[0]
+  socket.readyState = runtime.WebSocket.OPEN
+  socket.onopen()
+  await starting
+  const worklet = runtime.worklets[0]
+  const control = (message) => socket.onmessage({ data: JSON.stringify(message) })
+  const gap = () => worklet.port.onmessage({ data: { type: "starved" } })
+  const assertReservoir = (prebuffer, rebuffer) => {
+    const config = worklet.messages.filter((message) => message.type === "config").at(-1)
+    assert.ok(Math.abs(config.prebufferSeconds - prebuffer) < 1e-9, `expected prebuffer ${prebuffer}, got ${config.prebufferSeconds}`)
+    assert.ok(Math.abs(config.rebufferSeconds - rebuffer) < 1e-9, `expected rebuffer ${rebuffer}, got ${config.rebufferSeconds}`)
+    assert.equal(config.minRate, 1, "recovery changed music pitch")
+  }
+  control({ type: "hello", sessionId: "first-take", resumed: false })
+  control({ type: "status", state: "active", realtimeFactor: 1.203 })
+  assertReservoir(0.64, 0.8)
+  gap()
+  assertReservoir(0.84, 1.0)
+  assert.equal(JSON.parse(socket.sent.at(-1)).type, "gap")
+
+  control({ type: "status", state: "active", realtimeFactor: 1.157 })
+  assertReservoir(1.1, 1.2)
+  stream.pause()
+  gap() // an already-posted report from before pause must not add slack
+  assertReservoir(1.1, 1.2)
+  await stream.start(CONTROLS)
+  stream.setControls({ station: "rainy-piano", drums: false })
+  control({ type: "hello", sessionId: "first-take", resumed: true })
+  control({ type: "status", state: "active", realtimeFactor: 1.157 })
+  assertReservoir(1.1, 1.2)
+
+  for (let i = 0; i < 10; i++) gap()
+  assertReservoir(1.7, 1.8)
+  control({ type: "status", state: "active", realtimeFactor: 1.203 })
+  assertReservoir(1.44, 1.6)
+
+  stream.newVariation()
+  assertReservoir(0.64, 0.8)
+  gap() // old-take reports during the variation handshake are ignored
+  assertReservoir(0.64, 0.8)
+  control({ type: "variation", sessionId: "second-take" })
+  assertReservoir(0.64, 0.8)
+  gap()
+  assertReservoir(0.84, 1.0)
+  control({ type: "hello", sessionId: "third-take", resumed: false })
+  assertReservoir(0.64, 0.8)
+  gap()
+  assertReservoir(0.84, 1.0)
+  control({ type: "hello", sessionId: "different-session", resumed: true })
+  assertReservoir(0.64, 0.8)
+  await stream.destroy()
+})
+
+await test("timer fallback resumes retained sources without overlapping new PCM", async () => {
+  const runtime = loadStream(() => Promise.reject(new Error("worklet unavailable")))
+  const stream = new runtime.MrtStream(() => {})
+  const starting = stream.start(CONTROLS)
+  const socket = runtime.sockets[0]
+  socket.readyState = runtime.WebSocket.OPEN
+  socket.onopen()
+  await starting
+  const tick = [...runtime.intervals.values()][0].fn
+  const ctx = runtime.contexts[0]
+  socket.onmessage({ data: new ArrayBuffer(30720 * 4) })
+  socket.onmessage({ data: new ArrayBuffer(30720 * 4) })
+  tick()
+  assert.equal(runtime.sources.length, 1)
+  const firstEnd = runtime.sources[0].startedAt + runtime.sources[0].buffer.duration
+
+  ctx.currentTime = 0.05
+  stream.pause()
+  ctx.currentTime = 0.13
+  await stream.start(CONTROLS)
+  tick()
+  ctx.currentTime = 0.25
+  tick()
+  assert.equal(runtime.sources.length, 2)
+  assert.equal(runtime.sources[1].startedAt, firstEnd, "resume stacked new PCM onto retained audio")
+
+  runtime.sources[0].onended()
+  assert.equal(runtime.sources[0].disconnected, true, "ended source retained its audio connection")
+  await stream.destroy()
+  assert.equal(runtime.sources[1].disconnected, true)
+  assert.equal(runtime.intervals.size, 0)
+})
+
+await test("timer fallback applies learned slack to its rebuffer threshold after a gap", async () => {
+  const runtime = loadStream(() => Promise.reject(new Error("worklet unavailable")))
+  const stream = new runtime.MrtStream(() => {})
+  const starting = stream.start(CONTROLS)
+  const socket = runtime.sockets[0]
+  socket.readyState = runtime.WebSocket.OPEN
+  socket.onopen()
+  await starting
+  socket.onmessage({ data: JSON.stringify({ type: "status", state: "active", realtimeFactor: 1.2 }) })
+  const tick = [...runtime.intervals.values()][0].fn
+  socket.onmessage({ data: new ArrayBuffer(30720 * 4) }) // 0.64 s
+  tick()
+  assert.equal(runtime.sources.length, 1)
+  runtime.contexts[0].currentTime = 0.56
+  tick()
+  assert.equal(JSON.parse(socket.sent.at(-1)).type, "gap")
+
+  runtime.contexts[0].currentTime = 0.7
+  socket.onmessage({ data: new ArrayBuffer(43200 * 4) }) // 0.9 s
+  tick()
+  assert.equal(runtime.sources.length, 1, "fallback resumed at the shorter fresh-start threshold")
+  socket.onmessage({ data: new ArrayBuffer(4800 * 4) }) // reaches the learned 1 s recovery threshold
+  tick()
+  assert.equal(runtime.sources.length, 2)
+  await stream.destroy()
 })
 
 await test("server restart preserves the stream object and schedules reconnect", async () => {
@@ -486,7 +628,7 @@ await test("server restart preserves the stream object and schedules reconnect",
   socket.onclose({ code: 1012, reason: "service restart" })
 
   assert.equal(runtime.timers.size, 1)
-  assert.equal(runtime.intervals.size, 1)
+  assert.equal(runtime.intervals.size, 0)
   assert.equal(runtime.contexts[0].state, "running")
   assert.equal(runtime.worklets[0].port.closed, false)
   assert.equal(runtime.worklets[0].messages.at(-1).type, "reset")

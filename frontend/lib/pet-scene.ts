@@ -12,7 +12,7 @@
 // it is built out of blobs rather than out of pixel spans because everything
 // here has to move. a span table can blink and it can shift a rank; it cannot
 // settle on a downbeat, lean towards a cursor, or lay a tail that flows. a
-// field of metaballs does all three for free - the parts merge where they
+// field of metaballs supports all three - the parts merge where they
 // overlap, so the head does not sit on the body so much as rise out of it,
 // which is exactly what a loaf looks like.
 //
@@ -21,7 +21,7 @@
 // move and nothing that should not. the numbers were tuned by looking at the
 // output; if you change one, look again rather than reasoning about it.
 
-import { BlobSet, limb, shadeSolid, SURFACE } from "./dot-field"
+import { BlobSet, limb, shadeSolid, smoothstep, surfaceDistance } from "./dot-field"
 
 export const PET_W = 45
 export const PET_H = 32
@@ -60,9 +60,7 @@ export const LIT = 4
 export const HOT = 5
 export const ACCENT = 6
 
-// what the cat is doing, which is the whole of its expression. these are named
-// after what you would say it was doing if you looked over at it, because that
-// is also what the caption under the panel says.
+// What the cat is doing, expressed through its pose and face.
 export type PetMood = "idle" | "bop" | "focus" | "purr" | "happy" | "cheer" | "sleep"
 
 export interface PetFrame {
@@ -138,15 +136,34 @@ export const IDLE_FRAME: PetFrame = {
 
 type Grid = Uint8Array
 
+// The coat is a continuous body underneath the markings. Keeping these
+// layers separate avoids cracks wherever two palette shades meet.
+export const COAT = new Float32Array(PET_W * PET_H)
+export const RIM = new Float32Array(PET_W * PET_H)
+export const HEAD_SHADOW = new Float32Array(PET_W * PET_H)
+export const DETAILS = new Uint8Array(PET_W * PET_H)
+export const DETAIL_X = new Float32Array(PET_W * PET_H)
+export const DETAIL_Y = new Float32Array(PET_W * PET_H)
+let markX = 0
+let markY = 0
+
+const mark = (g: Grid, r: number, c: number, v: number) => {
+  const i = r * PET_W + c
+  g[i] = v
+  DETAILS[i] = v
+  DETAIL_X[i] = markX
+  DETAIL_Y[i] = markY
+}
+
 const at = (g: Grid, r: number, c: number, v: number) => {
-  if (r >= 0 && r < PET_H && c >= 0 && c < PET_W) g[r * PET_W + c] = v
+  if (r >= 0 && r < PET_H && c >= 0 && c < PET_W) mark(g, r, c, v)
 }
 
 // paint only where the cat already is, for a marking that follows the body it
 // is on rather than hanging in the air beside it
 const over = (g: Grid, r: number, c: number, v: number) => {
   if (r >= 0 && r < PET_H && c >= 0 && c < PET_W && g[r * PET_W + c] !== OFF) {
-    g[r * PET_W + c] = v
+    mark(g, r, c, v)
   }
 }
 
@@ -157,7 +174,7 @@ const over = (g: Grid, r: number, c: number, v: number) => {
 // large for their head, so without this they would eat the sides of it.
 const onFur = (g: Grid, r: number, c: number, v: number) => {
   if (r >= 0 && r < PET_H && c >= 0 && c < PET_W && g[r * PET_W + c] === LIT) {
-    g[r * PET_W + c] = v
+    mark(g, r, c, v)
   }
 }
 
@@ -244,20 +261,8 @@ const SCRATCH: Grid = new Uint8Array(PET_W * PET_H)
 const FIELD = new Float32Array(PET_W * PET_H)
 const BLOBS = new BlobSet()
 
-// how much ink each cell holds, 0..1, alongside the grid of shades. the cat is
-// drawn as liquid rather than as dots (see lib/ink-render), and this is what
-// tells a cell how far to swell: cells deep inside the body are saturated and
-// overlap their neighbours into one mass, cells out at the edge of the field
-// are partial and bead.
-//
-// it is taken from the same field the silhouette is cut from, so the ink
-// thickens exactly where the cat is thick. anything struck on afterwards - a
-// marking, a note, a heart - has no field under it and keeps the flat value
-// below, which is what keeps the small crisp marks crisp while the body flows.
+// Coverage for crisp face details and floating notes, separate from the coat.
 export const INK = new Float32Array(PET_W * PET_H)
-const INK_FLAT = 0.62
-// where inside the surface the ink counts as saturated
-const INK_FULL = SURFACE * 2.1
 // the head on its own, kept apart from the rest so its outline can be struck
 // back over the body it is sunk into
 const HEAD_BLOBS = new BlobSet()
@@ -269,33 +274,17 @@ let headY = 14
 let headR = 4.7
 let faceWide = 1
 let baseRow = Math.round(GROUND)
+let floorY = GROUND
 let tailFlick = 0
-
-// whole dots, with a grip. everything that carries a marking has to sit on a
-// whole dot, but Math.round moves the part the instant the continuous value
-// crosses the half-dot line - so a value breathing on that line, as the beat
-// envelope always is, drags the head back and forth a dot at frame rate,
-// and a face that vibrates reads as a fault in the panel. a settled part
-// holds its dot until the value has committed clearly past the line, and
-// then lands once. real motion - a sway, a lift, a lean - sails through the
-// threshold and is never held back by it; only the tremble is.
-const SETTLED = new Map<string, number>()
-const settle = (key: string, want: number, grip = 0.65): number => {
-  const held = SETTLED.get(key)
-  if (held !== undefined && Math.abs(want - held) < grip) return held
-  const next = Math.round(want)
-  SETTLED.set(key, next)
-  return next
-}
 
 export function drawPet(f: PetFrame): Grid {
   const g = SCRATCH
+  DETAILS.fill(255)
+  markX = markY = 0
 
   poseBody(f)
   BLOBS.scatter(FIELD, PET_W, PET_H)
-  // cut the field off flat along the ground. a loaf has a flat bottom, and a
-  // metaball never will on its own.
-  if (baseRow + 1 < PET_H) FIELD.fill(0, (baseRow + 1) * PET_W)
+  HEAD_BLOBS.scatter(HEAD_FIELD, PET_W, PET_H)
 
   // a solid cat with one dot of rim all round it and a breath of glow outside.
   // the rim is what keeps the silhouette legible at this pitch: a metaball
@@ -307,24 +296,35 @@ export function drawPet(f: PetFrame): Grid {
     haloAt: 0.4,
   })
 
-  // the ink, read off the field before any marking is struck on top of it. a
-  // cell just inside the surface is a bead and the belly is saturated, so the
-  // silhouette's edge flows and pools instead of stepping.
+  // Distance-based coverage keeps the edge soft by one cell regardless of
+  // blob size. Intersect with a continuous floor so a hop never drops an
+  // entire row of belly at once.
   for (let i = 0; i < FIELD.length; i++) {
-    const v = FIELD[i]
-    if (v <= 0) {
-      INK[i] = INK_FLAT
-      continue
-    }
-    const t = Math.min(1, Math.max(0, (v - SURFACE * 0.4) / (INK_FULL - SURFACE * 0.4)))
-    INK[i] = 0.4 + 0.6 * (t * t * (3 - 2 * t))
+    const ground = floorY + 0.35 - Math.floor(i / PET_W)
+    const d = Math.min(ground, surfaceDistance(FIELD, i, PET_W))
+    const headD = surfaceDistance(HEAD_FIELD, i, PET_W)
+    COAT[i] = smoothstep(-0.65, 0.8, d)
+    const edge = smoothstep(-0.6, 0.2, d) * (1 - smoothstep(0.2, 1.15, d))
+    const headEdge = smoothstep(-0.4, 0.3, headD) * (1 - smoothstep(0.3, 1.1, headD))
+    RIM[i] = Math.max(edge, headEdge * smoothstep(0, 0.8, d) * 0.7)
+    HEAD_SHADOW[i] = smoothstep(-1.3, -0.5, headD) *
+      (1 - smoothstep(-0.5, 0.2, headD)) * smoothstep(0.5, 1.5, d)
+    if (ground < 0) g[i] = OFF
   }
 
   drawShadow(g, f)
-  drawHeadEdge(g)
+  markY = floorY - baseRow
   drawMarkings(g)
+  markX = headX - Math.round(headX)
+  markY = headY - Math.round(headY)
   drawFace(g, f)
+  markX = markY = 0
   drawFloaters(g, f)
+  for (let i = 0; i < INK.length; i++) {
+    // Eye sockets are opaque cutouts in the coat. Other details keep a
+    // little air between dots so small expressions remain legible.
+    INK[i] = DETAILS[i] === 255 ? 0 : DETAILS[i] === OFF ? 1 : 0.65
+  }
 
   return g
 }
@@ -356,20 +356,9 @@ function poseBody(f: PetFrame) {
   const wide = 1 - spread * (spread > 0 ? 0.18 : 0.34)
   const tall = 1 + (springy < 0 ? springy * 0.17 : 0)
   const rScale = 1 + springy * 0.05
-  // whole dots. everything that carries a marking - the head with its face on
-  // it, the ground with the paws sitting on it - has to move a dot at a time,
-  // because the marking can only ever be drawn a dot at a time. a head sliding
-  // by a third of a dot moves its silhouette and leaves its face where it was,
-  // and the result reads as a fault rather than as motion. the shape changes -
-  // the squash, the ear flick, the tail - stay continuous, because nothing is
-  // struck onto them.
-  //
-  // the lift is events only: a hop and a hand land on a dot and stay there
-  // for a moment. the music used to ride the whole loaf up off the ground
-  // between beats, and however smoothly it did so, a body that travels twice
-  // a second is a bounce - the loaf now keeps its seat and leaves the beat
-  // to the head.
-  const lift = Math.round(f.hop * 2.4 - f.pat * 0.7)
+  // Markings carry the fractional translation of their body part when
+  // painted, so the pose can move freely without leaving the face behind.
+  const lift = f.hop * 2.4 - f.pat * 0.7
   // the breath deepens a touch when the music is on - ribs working under a
   // still coat is most of what keeps a motionless body from reading as a
   // statue of itself
@@ -390,10 +379,8 @@ function poseBody(f: PetFrame) {
 
   faceWide = wide
   const floor = GROUND - lift
-  // settled, not rounded: the flat cut along the ground, the paws and the
-  // haunch all sit on this row, and nothing that breathes through `lift`
-  // may strobe the whole base of the animal across two rows.
-  baseRow = settle("base", floor)
+  floorY = floor
+  baseRow = Math.round(floor)
   const up = (d: number) => floor - (PIVOT + (d - PIVOT) * tall)
   const out = (d: number) => BODY_X + d * wide
 
@@ -423,8 +410,8 @@ function poseBody(f: PetFrame) {
   // rhythm, where the side-to-side rock is the cat's own slower tempo. it
   // rides `pulse`, not `bob`: bob never returns to zero between kicks in a
   // busy mix, and a nod driven by it sat pressed instead of nodding. the
-  // pulse is the beat with the mix subtracted, deep enough to clear the
-  // settle grip on every real kick - one visible dot down, back up between.
+  // pulse is the beat with the mix subtracted: a full dip on every real
+  // kick, back up between.
   const dip = f.pulse * f.groove * 1.7
   // the rest of the fluid motion, all of it slow and all of it continuous:
   // the loaf leans a fraction of a dot with the music on a lazier period
@@ -465,25 +452,15 @@ function poseBody(f: PetFrame) {
   // from skull to base, and the one job of the geometry is that the widening
   // happens over two rows rather than over eight - a slope that gradual is a
   // tent, and a tent is not an animal.
-  const sag = settle("sag", lean * 0.25)
+  const sag = lean * 0.25
   headR = 5.0 * rScale
-  // settled, not rounded: the sway and the lean sail through the half-dot
-  // line and land cleanly, but the beat envelope trembling in the sway's
-  // amplitude used to dither the head - and the whole face with it - across
-  // two columns at frame rate.
-  //
-  // and capped on the right, where the mound is. the sway alone stays short
-  // of the shoulder, but the cursor's lean stacking on top of it used to
-  // carry the cheek two further dots into the body. the cap is the shoulder
-  // itself: a head turns only so far into its own animal, however
-  // interesting the thing on that side is - the pupils carry the rest of a
-  // rightward look.
-  headX = settle("headX", Math.min(HEAD_X + 1.35, HEAD_X + lean + sway))
+  // The shoulder limits the inward turn; pupils carry the rest of the look.
+  headX = Math.min(HEAD_X + 1.35, HEAD_X + lean + sway)
   // the beat lands here, and only here: the body is still, so the head
-  // keeping time has to carry the beat itself. it is small on purpose - one
-  // settled dot on a strong kick, back up between kicks - because a head
+  // keeping time has to carry the beat itself. it is small on purpose - a
+  // small dip on a strong kick, back up between kicks - because a head
   // that ploughs into the chest is a cat being pressed, not a cat nodding.
-  headY = settle("headY", up(15.2) + nod + dip)
+  headY = up(15.2) + nod + dip
   const skull = 2.2 * wide + (f.mood === "happy" || f.mood === "cheer" ? 0.4 : 0)
   head(headX - skull, headY, headR)
   head(headX, headY, headR * 1.02)
@@ -594,59 +571,6 @@ function ear(
   }
 }
 
-// the head's own outline, struck onto the body wherever the two overlap.
-//
-// a loaf has no neck, so the head and the body are one field and the silhouette
-// runs from ear to rump without a break in it - which leaves the head reading
-// as the narrow end of a mound rather than as a head. drawing the head's edge
-// where it lies over the chest and the shoulder puts the two masses back in
-// front of and behind each other. it is the one line an artist would draw
-// first and the only one a merged field cannot give you.
-//
-// the rim is taken from the head's field the same way the silhouette's is
-// taken from the whole cat's, so the two are one continuous outline: outside,
-// the head's edge already is the silhouette; inside, this is the rest of it.
-function drawHeadEdge(g: Grid) {
-  HEAD_BLOBS.scatter(HEAD_FIELD, PET_W, PET_H)
-  if (baseRow + 1 < PET_H) HEAD_FIELD.fill(0, (baseRow + 1) * PET_W)
-  for (let y = 1; y < PET_H - 1; y++) {
-    const base = y * PET_W
-    for (let x = 1; x < PET_W - 1; x++) {
-      const i = base + x
-      if (HEAD_FIELD[i] < SURFACE) continue
-      if (
-        HEAD_FIELD[i - 1] >= SURFACE &&
-        HEAD_FIELD[i + 1] >= SURFACE &&
-        HEAD_FIELD[i - PET_W] >= SURFACE &&
-        HEAD_FIELD[i + PET_W] >= SURFACE
-      ) {
-        continue
-      }
-      // `onFur` and not `at`: where the head's edge already is the outside of
-      // the cat it is drawn once, by shadeSolid, and must not be drawn twice
-      onFur(g, y, x, HOT)
-      // and a shadow in the fur immediately outside it. a lit line on its own
-      // is a line drawn on a surface; a lit line with a dark one under it is
-      // one surface standing off another, and that is the whole difference
-      // between a face painted on a loaf and a head in front of a body.
-      if (HEAD_FIELD[i - 1] < SURFACE) shade(g, y, x - 1)
-      if (HEAD_FIELD[i + 1] < SURFACE) shade(g, y, x + 1)
-      if (HEAD_FIELD[i - PET_W] < SURFACE) shade(g, y - 1, x)
-      if (HEAD_FIELD[i + PET_W] < SURFACE) shade(g, y + 1, x)
-    }
-  }
-}
-
-// one dot of shadow, laid only on plain fur - never on the silhouette's own
-// rim, which would notch it, and never on a dot the head's outline has already
-// claimed.
-//
-// two ranks below the fur, not one. the two themes each lean on a different
-// half of this pair: on the dark panel the outline is cream against amber and
-// carries it, on paper the outline is near-black against dark brown and barely
-// registers, so there the shadow has to. one rank down it did not.
-const shade = (g: Grid, r: number, c: number) => onFur(g, r, c, DIM)
-
 // the ground the loaf is sitting on, drawn as a shadow rather than as a line.
 // it is here for the hop: without something staying put underneath, a cat that
 // lifts two dots reads as a cat that has been nudged rather than as a cat that
@@ -665,14 +589,16 @@ function drawShadow(g: Grid, f: PetFrame) {
 // markings struck onto the silhouette once it is shaded
 // ---------------------------------------------------------------------------
 function drawMarkings(g: Grid) {
-  const hc = Math.round(headX)
-
   // inner ears, a shade back from the fur round them. `onFur` keeps them on
   // the ear even as it swings, and off the outline, which is the whole reason
   // they are struck late.
   for (const side of [-1, 1]) {
-    const ec = Math.round(hc + side * 4.8 * faceWide)
-    const er = Math.round(headY - headR * 0.5 - 3.2)
+    const earX = headX + side * 4.8 * faceWide
+    const earY = headY - headR * 0.5 - 3.2
+    const ec = Math.round(earX)
+    const er = Math.round(earY)
+    markX = earX - ec
+    markY = earY - er
     onFur(g, er, ec, MID_SHADE)
     onFur(g, er + 1, ec, MID_SHADE)
   }
@@ -689,10 +615,13 @@ function drawMarkings(g: Grid) {
   // is the deeper of its body seat and one rank clear of the jaw, so the
   // head can never pass through it, only push it.
   const chestX = Math.round(HEAD_X)
-  const hr = Math.round(headY)
-  const collar = Math.max(baseRow - 6, hr + 9)
+  const collarY = Math.max(floorY - 6, headY + 9)
+  const collar = Math.round(collarY)
+  markX = 0
+  markY = collarY - collar
   overRow(g, collar, chestX - 6, chestX + 6, ACCENT)
   onFur(g, collar + 1, chestX, HOT)
+  markY = floorY - baseRow
 
   // ---- the two front paws, tucked under the front of the loaf. they are the
   // detail that says loaf rather than lump: a cat sitting like this has its

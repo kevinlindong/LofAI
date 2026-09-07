@@ -1,6 +1,8 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
   darkMode: ['class'],
+  // These classes are selected at runtime from the saved color theme.
+  safelist: ['theme-light', 'theme-dark', 'theme-ocean', 'theme-dusk', 'theme-forest', 'theme-rose'],
   content: [
     './pages/**/*.{js,ts,jsx,tsx,mdx}',
     './components/**/*.{js,ts,jsx,tsx,mdx}',

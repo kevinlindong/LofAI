@@ -39,7 +39,7 @@ slow = 0.050  # 50ms/frame -> 0.8x
 steps = []
 t = 0.0
 for i in range(60):
-    e._costs.append(slow)
+    e._costs.append((1, slow))
     e._retune(t)
     steps.append(e.codebooks)
     t += 1.0
@@ -51,7 +51,7 @@ check("it steps rather than lurches", changes == 12 - E.MIN_CODEBOOKS, f"{change
 e = fresh(); e.codebooks = 8; e._depth_config.num_active_codebooks = 8
 t = 0.0
 for i in range(80):
-    e._costs.append(0.040 / 1.50)   # 1.50x - comfortably over 1.15*1.3
+    e._costs.append((1, 0.040 / 1.50))   # comfortably over 1.15*1.3
     e._retune(t); t += 1.0
 check("real headroom restores detail", e.codebooks == 12, f"now {e.codebooks}")
 
@@ -59,7 +59,7 @@ check("real headroom restores detail", e.codebooks == 12, f"now {e.codebooks}")
 e = fresh(); e.codebooks = 8; e._depth_config.num_active_codebooks = 8
 t = 0.0
 for i in range(80):
-    e._costs.append(0.040 / 1.20)   # 1.20x: above target, below the raise line
+    e._costs.append((1, 0.040 / 1.20))   # above target, below the raise line
     e._retune(t); t += 1.0
 check("a bare pass does not climb", e.codebooks == 8, f"now {e.codebooks}")
 
@@ -67,7 +67,7 @@ check("a bare pass does not climb", e.codebooks == 8, f"now {e.codebooks}")
 e = fresh(); e.pinned_codebooks = 10; e.set_codebooks(10)
 e.note_gap()
 for i in range(40):
-    e._costs.append(0.060)
+    e._costs.append((1, 0.060))
     e._retune(float(i))
 check("a pinned count never moves", e.codebooks == 10, f"now {e.codebooks}")
 
@@ -103,14 +103,17 @@ for _ in range(20): e.note_gap()
 check("an explicit experimental floor is honored",
       e.codebooks == E.ABSOLUTE_MIN_CODEBOOKS, f"now {e.codebooks}")
 
-# the smoother ignores a single bad chunk
+# Diagnostics count real elapsed time, while an isolated stall preserves depth.
 e = fresh()
 for _ in range(30): e.note_render(50, 50 * 0.030)   # steady 1.33x
 before = e.realtime_factor()
 e.note_render(50, 50 * 0.200)                        # one six-times-slow chunk
 after = e.realtime_factor()
-check("one slow chunk does not move the estimate",
-      abs(after - before) < 1e-9, f"{before:.2f}x -> {after:.2f}x")
+check("throughput includes a slow chunk's actual cost",
+      abs(after - (9 * 0.040 / (8 * 0.030 + 0.200))) < 1e-9,
+      f"{before:.2f}x -> {after:.2f}x")
+e._retune(E.time.monotonic())
+check("one isolated stall does not spend fidelity", e.codebooks == 12)
 
 # ...but a machine that is genuinely slow still gets noticed
 e = fresh()
@@ -119,11 +122,49 @@ for _ in range(6): e.note_render(50, 50 * 0.055)     # six slow chunks running
 check("a sustained slowdown is noticed",
       e.realtime_factor() < 0.8, f"now {e.realtime_factor():.2f}x")
 
-# an outlier every other chunk still must not drag it under
-e = fresh()
+# Recurring stalls drain the reservoir even when the median chunk is fast.
+e = fresh(); e.pinned_codebooks = 12
 for i in range(40): e.note_render(50, 50 * (0.200 if i % 3 == 0 else 0.030))
-check("one bad chunk in three is still judged on the good ones",
-      e.realtime_factor() > 1.25, f"now {e.realtime_factor():.2f}x")
+check("recurring stalls expose unsustainable throughput",
+      abs(e.realtime_factor() - (9 * 0.040 / (3 * 0.200 + 6 * 0.030))) < 1e-9,
+      f"now {e.realtime_factor():.2f}x")
+e.pinned_codebooks = 0
+e._retune(e._last_tune + E.TUNE_DWELL_SECONDS + 1)
+check("recurring stalls lower depth before the next gap", e.codebooks == 11)
+
+# A single slow render in every window is still periodic, not a one-off.
+e = fresh()
+for i in range(36):
+    with patch.object(E.time, "monotonic", return_value=100.0 + i * 0.4):
+        e.note_render(10, 10 * (0.200 if i % E.COST_WINDOW == 0 else 0.030))
+check("periodic once-per-window stalls cannot evade tuning", e.codebooks < 12)
+
+# The deficit timer clears as soon as healthy throughput returns.
+e = fresh()
+for i in range(36):
+    with patch.object(E.time, "monotonic", return_value=100.0 + i * 0.4):
+        e.note_render(10, 10 * (0.200 if i == 12 else 0.030))
+check("recovered isolated jitter preserves full depth",
+      e.codebooks == 12 and e._deficit_since is None)
+
+e = fresh(); e._seed_cost(0.030)
+with patch.object(E.time, "monotonic", return_value=100.0):
+    e.note_render(25, 25 * 0.200)
+e.note_idle()
+with patch.object(E.time, "monotonic", return_value=200.0):
+    e.note_render(10, 10 * 0.030)
+check("a long pause is not a sustained generation deficit", e.codebooks == 12)
+
+# Short startup chunks must not weigh as much as a long steady render.
+e = fresh(); e.pinned_codebooks = 12
+e.note_render(1, 0.1)
+e.note_render(10, 0.2)
+check("throughput weights chunks by generated audio",
+      abs(e.realtime_factor() - (11 * 0.040 / 0.3)) < 1e-9)
+samples = len(e._costs)
+for invalid in (float("nan"), float("inf"), 0.0, -1.0):
+    e.note_render(10, invalid)
+check("invalid timing cannot poison throughput", len(e._costs) == samples)
 
 # pause keeps the exact amount of already-generated audio, while a disconnect
 # correctly discards that client-side lead

@@ -10,6 +10,7 @@ import engine as engine_mod
 import styles
 from session import ACTIVE, QUEUED, SUSPENDED, Session
 from take_health import crossfade_pcm
+from worker_priority import configure_worker_priority
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ MAX_TOTAL = max(MAX_ACTIVE, _env_int("MRT_MAX_SESSIONS_TOTAL", 8))
 # longest the worker sleeps when nobody needs audio
 IDLE_WAIT = 0.25
 GPU_KEEPALIVE_SECONDS = 0.02
+STATUS_INTERVAL_SECONDS = 4.0
 
 
 class SessionManager:
@@ -89,6 +91,8 @@ class SessionManager:
         self._cursor = 0
         self._last_reap = time.monotonic()
         self._last_quality = 0
+        self._last_status_at = 0.0
+        self._worker_qos = "unavailable"
         # Model/config mutations must stay on the MLX worker thread. The event
         # loop only raises these coalesced feedback flags and wakes it.
         self._pending_gap = False
@@ -536,6 +540,7 @@ class SessionManager:
         # tell every attached client where it stands
         if self._stopping.is_set():
             return
+        self._last_status_at = time.monotonic()
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
@@ -569,6 +574,7 @@ class SessionManager:
                 "melodyGuided": False,
                 "mlxCacheLimitMB": self.engine.mlx_cache_mb,
                 "pipelined": self.engine._fast,
+                "workerQoS": self._worker_qos,
                 "fastSampler": self.engine._fast_sampling,
                 "fastEngine": (
                     self.engine._fast_engine.summary()
@@ -598,6 +604,7 @@ class SessionManager:
 
     def _run(self):
         try:
+            self._worker_qos = configure_worker_priority()
             if not self._load():
                 return
 
@@ -630,6 +637,10 @@ class SessionManager:
                     keep_warm = getattr(self.engine, "keep_gpu_warm", None)
                     if active and keep_warm is not None:
                         keep_warm()
+                    elif not active:
+                        note_idle = getattr(self.engine, "note_idle", None)
+                        if note_idle is not None:
+                            note_idle()
                     continue
 
                 maximum_frames = self._chunk_frames(session)
@@ -709,8 +720,13 @@ class SessionManager:
                         # the historical one-argument callback.
                         sink(pcm)
 
-                if self.engine.codebooks != self._last_quality or capacity_changed:
-                    # the tuner moved; tell clients so their reservoirs follow
+                if (
+                    self.engine.codebooks != self._last_quality
+                    or capacity_changed
+                    or time.monotonic() - self._last_status_at >= STATUS_INTERVAL_SECONDS
+                ):
+                    # Throughput can change at the quality floor too. Send
+                    # fresh measurements so the client's reservoir can adapt.
                     self._last_quality = self.engine.codebooks
                     self._broadcast_status()
         finally:

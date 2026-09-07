@@ -15,6 +15,12 @@ export const GLYPHS = {
   check: [".....", "....X", "...X.", "X.X..", ".X..."],
   plus: ["..X..", "..X..", "XXXXX", "..X..", "..X.."],
   cross: ["X...X", ".X.X.", "..X..", ".X.X.", "X...X"],
+  menu: ["XXXXXXX", ".......", "XXXXXXX", ".......", "XXXXXXX"],
+  chevron: ["X...X", ".X.X.", "..X.."],
+  settings: ["..XXX..", "X..X..X", "X.XXX.X", ".XX.XX.", "X.XXX.X", "X..X..X", "..XXX.."],
+  music: ["..XXXXX", "..X...X", "..X...X", "..X...X", "XXX.XXX", "XXX.XXX", ".X...X."],
+  list: ["X.XXXXX", ".......", "X.XXXXX", ".......", "X.XXXXX"],
+  timer: ["..XXX..", "...X...", ".XXXXX.", "X..X..X", "X..XX.X", "X.....X", ".XXXXX."],
 } as const
 
 export type GlyphName = keyof typeof GLYPHS

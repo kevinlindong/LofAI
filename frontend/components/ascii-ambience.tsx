@@ -93,7 +93,7 @@ export function AsciiAmbience() {
     const layer = layerRef.current
     const canvas = canvasRef.current
     if (!layer || !canvas) return
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)")
     const ctx = canvas.getContext("2d")
     if (!ctx) return
 
@@ -104,6 +104,7 @@ export function AsciiAmbience() {
     let nx = 0
     let ny = 0
     let queued = false
+    let pointerRaf = 0
     const flush = () => {
       queued = false
       layer.style.setProperty("--ax", nx.toFixed(4))
@@ -145,6 +146,7 @@ export function AsciiAmbience() {
     let cy = new Float32Array(0)
     let cf = new Float32Array(0)
     let cs = new Uint8Array(0)
+    let windowCells: InkCells | null = null
     const windowFor = (gx0: number, gy0: number, w: number, h: number): InkCells => {
       if (w !== winW || h !== winH) {
         winW = w
@@ -157,8 +159,13 @@ export function AsciiAmbience() {
           cf = new Float32Array(n)
           cs = new Uint8Array(n)
         }
+        windowCells = {
+          count: n,
+          x: cx.subarray(0, n), y: cy.subarray(0, n),
+          fill: cf.subarray(0, n), shade: cs.subarray(0, n),
+          ...tables,
+        }
       }
-      const n = w * h
       for (let r = 0; r < h; r++) {
         const py = (gy0 + r) * PITCH + PITCH / 2
         for (let c = 0; c < w; c++) {
@@ -167,14 +174,7 @@ export function AsciiAmbience() {
           cy[i] = py
         }
       }
-      return {
-        count: n,
-        x: cx.subarray(0, n),
-        y: cy.subarray(0, n),
-        fill: cf.subarray(0, n),
-        shade: cs.subarray(0, n),
-        ...tables!,
-      }
+      return windowCells!
     }
 
     // the region painted last frame, cleared before the next one - and after
@@ -188,8 +188,14 @@ export function AsciiAmbience() {
 
     let raf = 0
     let running = false
+    let lastPaint = 0
 
     const step = (now: number) => {
+      if (now - lastPaint < 1000 / 60 - 0.5) {
+        raf = requestAnimationFrame(step)
+        return
+      }
+      lastPaint = now
       clearDirty()
 
       // age the drops; the dead are compacted away
@@ -232,8 +238,9 @@ export function AsciiAmbience() {
       const h = Math.min(Math.ceil((Math.ceil(maxY / PITCH) - gy0 + 7) / 8) * 8, 512)
       const cells = windowFor(gx0, gy0, w, h)
 
+      blobs.scatter(cells.fill, w, h, PITCH, gx0 * PITCH + PITCH / 2, gy0 * PITCH + PITCH / 2)
       for (let i = 0; i < cells.count; i++) {
-        const v = blobs.at(cells.x[i], cells.y[i])
+        const v = cells.fill[i]
         cells.fill[i] = v <= WET_AT ? 0 : Math.min(1, (v - WET_AT) / (FULL_AT - WET_AT))
       }
 
@@ -253,6 +260,7 @@ export function AsciiAmbience() {
     const wake = () => {
       if (running) return
       running = true
+      lastPaint = 0
       raf = requestAnimationFrame(step)
     }
 
@@ -273,13 +281,14 @@ export function AsciiAmbience() {
     }
 
     const track = (event: PointerEvent) => {
+      if (motion.matches || document.hidden) return
       const w = window.innerWidth || 1
       const h = window.innerHeight || 1
       nx = (event.clientX / w) * 2 - 1
       ny = (event.clientY / h) * 2 - 1
       if (!queued) {
         queued = true
-        requestAnimationFrame(flush)
+        pointerRaf = requestAnimationFrame(flush)
       }
 
       const x = event.clientX
@@ -306,6 +315,7 @@ export function AsciiAmbience() {
     // a press pools ink under the pointer - the one deliberate mark the
     // background can make, and it evaporates like everything else
     const press = (event: PointerEvent) => {
+      if (motion.matches || document.hidden) return
       emit(event.clientX, event.clientY, PRESS_R)
       wake()
     }
@@ -318,6 +328,18 @@ export function AsciiAmbience() {
       lastY = -1
     }
 
+    const suspend = () => {
+      if (!motion.matches && !document.hidden) return
+      cancelAnimationFrame(raf)
+      cancelAnimationFrame(pointerRaf)
+      running = queued = false
+      drops.length = 0
+      clearDirty()
+      forget()
+    }
+
+    motion.addEventListener("change", suspend)
+    document.addEventListener("visibilitychange", suspend)
     window.addEventListener("pointermove", track, { passive: true })
     window.addEventListener("pointerdown", press, { passive: true })
     document.addEventListener("pointerleave", forget)
@@ -328,6 +350,9 @@ export function AsciiAmbience() {
       window.removeEventListener("resize", resize)
       themeWatch.disconnect()
       cancelAnimationFrame(raf)
+      cancelAnimationFrame(pointerRaf)
+      motion.removeEventListener("change", suspend)
+      document.removeEventListener("visibilitychange", suspend)
     }
   }, [])
 

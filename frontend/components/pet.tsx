@@ -1,9 +1,21 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef } from "react"
 import { gridNeighbours, paintInk, type InkCells, type InkGeometry } from "@/lib/ink-render"
+import { canvasLoop } from "@/lib/canvas-loop"
+import { LiquidInk } from "@/lib/liquid-ink"
+import { smoothstep } from "@/lib/dot-field"
 import {
   drawPet,
+  COAT,
+  RIM,
+  HEAD_SHADOW,
+  DETAILS,
+  DETAIL_X,
+  DETAIL_Y,
+  LIT,
+  HOT,
+  DIM,
   IDLE_FRAME,
   INK,
   PET_H,
@@ -43,30 +55,13 @@ const PALETTE_VARS = [
   "--dot-7",
 ]
 
-// the cat is ink on the matrix rather than a grid of dots. each cell is a dot
-// that swells with how much ink the field put there, and neighbouring dots of
-// the same shade pull a tangent-continuous membrane between them - so the fur
-// is one poured mass and the one-cell rim around it is a liquid outline. see
-// lib/ink-render for the connector's geometry and where it comes from.
-//
-// cells only ever fuse within their own shade, which is what keeps the rim a
-// line around the body instead of melting into it, and keeps a marking a
-// marking.
+// The coat stays continuous underneath changes of shade. Face dots travel
+// with the head by fractions of a pixel instead of snapping to a new column.
 const INK_GEO: InkGeometry = {
-  // fractions of the pitch, scaled once the pitch is known
-  minRadius: 0.22,
-  maxRadius: 0.54,
-  spread: 0.5,
-  handleSize: 2.4,
-  reach: 2.5,
-  dryRadius: 0.2,
-  diagonals: true,
+  minRadius: 0.12, maxRadius: 0.54,
+  spread: 0.5, handleSize: 2.4, reach: 2.5,
+  dryRadius: 0, diagonals: true, swellIn: 0.2,
 }
-
-// the unlit panel, and the sockets cut out of the fur. drawn as plain small
-// cells with no necks: bridged, the background would fuse into one sheet and
-// the matrix would stop being a matrix.
-const DRY_SHADE = 0
 
 // how long each reaction holds the cat's face
 const HOLD_MS: Record<Reaction, number> = {
@@ -76,14 +71,6 @@ const HOLD_MS: Record<Reaction, number> = {
   undo: 700,
   pet: 1400,
 }
-
-// every frame the display offers. thirty was the old setting, on the argument
-// that a dot matrix reads the same at half the rate and the other half of the
-// budget belongs to the music. that argument is wrong about the shape changes:
-// the squash, the ear flick and the tail curl are continuous, and at thirty
-// they stutter. building a frame costs a fortieth of a millisecond, so there
-// is nothing to save.
-const MIN_FRAME_MS = 0
 
 // how the head follows the beat, as time constants in seconds: drops fast,
 // comes back up slowly. seconds rather than per-frame fractions so the bob
@@ -126,23 +113,9 @@ const ATTENTION_MS = 4000
 const EYE_C = 16
 const EYE_R = 12
 
-// the caption is the other half of the animation. a tamagotchi tells you what
-// it is doing in words as well as in pixels, and at forty dots across the
-// words carry more of it than you would like to admit.
-const CAPTIONS: Record<PetMood, string> = {
-  sleep: "dozing",
-  cheer: "delighted",
-  happy: "pleased",
-  purr: "purring",
-  focus: "keeping watch",
-  bop: "bopping",
-  idle: "loafing",
-}
-
 export function Pet({ signal, focus, playing, getLevel }: PetProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
-  const [caption, setCaption] = useState("idling")
 
   // everything the animation loop reads lives in refs: the loop runs at frame
   // rate and must never be the reason react re-renders
@@ -173,7 +146,8 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
 
     // set only when the animation loop is not running, so the single drawn
     // frame can be re-struck after a resize or a theme change
-    let redrawStill: (() => void) | null = null
+    let loop: ReturnType<typeof canvasLoop> | undefined
+    let panelDirty = true
 
     let palette = PALETTE_VARS.map(() => "#000")
     const readPalette = () => {
@@ -185,7 +159,8 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     // the palette lives in css variables, so a theme flip has to be watched for
     const themeWatch = new MutationObserver(() => {
       readPalette()
-      redrawStill?.()
+      panelDirty = true
+      loop?.redraw()
     })
     themeWatch.observe(document.documentElement, {
       attributes: true,
@@ -199,16 +174,13 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     // frame that has just been drawn
     const resize = (): boolean => {
       const nextDpr = Math.min(2, window.devicePixelRatio || 1)
-      // whole-pixel pitch only, and capped: past about six pixels the dots stop
-      // reading as a matrix and start reading as circles, and the cat stops
-      // being a small thing on a shelf. the floor is what the drawing needs to
-      // still be a cat.
-      const nextPitch = Math.min(6, Math.max(3, Math.floor(wrap.clientWidth / PET_W)))
+      // Scale the artwork to the whole card, keeping its original proportions.
+      const nextPitch = Math.max(1, wrap.getBoundingClientRect().width / PET_W)
       if (nextPitch === pitch && nextDpr === dpr) return false
       pitch = nextPitch
       dpr = nextDpr
-      canvas.width = PET_W * pitch * dpr
-      canvas.height = PET_H * pitch * dpr
+      canvas.width = Math.round(PET_W * pitch * dpr)
+      canvas.height = Math.round(PET_H * pitch * dpr)
       canvas.style.width = `${PET_W * pitch}px`
       canvas.style.height = `${PET_H * pitch}px`
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -216,65 +188,85 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     }
     resize()
     const sizeWatch = new ResizeObserver(() => {
-      if (resize()) redrawStill?.()
+      if (resize()) {
+        panelDirty = true
+        loop?.redraw()
+      }
     })
     sizeWatch.observe(wrap)
 
-    // the lattice never changes shape, so its neighbour tables are built once
     const neighbours = gridNeighbours(PET_W, PET_H)
     const cells: InkCells = {
       count: PET_W * PET_H,
       x: new Float32Array(PET_W * PET_H),
       y: new Float32Array(PET_W * PET_H),
-      fill: new Float32Array(PET_W * PET_H),
+      fill: COAT,
       shade: new Uint8Array(PET_W * PET_H),
       ...neighbours,
     }
+    const details: InkCells = {
+      ...cells,
+      x: new Float32Array(cells.count),
+      y: new Float32Array(cells.count),
+      fill: INK,
+      shade: DETAILS,
+    }
+    const panel = document.createElement("canvas")
+    const panelCtx = panel.getContext("2d")!
     let placedAt = -1
-    // cell centres in pixels, re-laid only when the pitch changes
+    let geo: InkGeometry
+    let detailGeo: InkGeometry
+    let coat: LiquidInk, shadow: LiquidInk, rim: LiquidInk
+
     const place = () => {
-      if (placedAt === pitch) return
-      placedAt = pitch
-      for (let r = 0; r < PET_H; r++) {
-        for (let c = 0; c < PET_W; c++) {
-          const i = r * PET_W + c
-          cells.x[i] = c * pitch + pitch / 2
-          cells.y[i] = r * pitch + pitch / 2
+      if (placedAt !== pitch) {
+        placedAt = pitch
+        panelDirty = true
+        for (let r = 0; r < PET_H; r++) {
+          for (let c = 0; c < PET_W; c++) {
+            const i = r * PET_W + c
+            cells.x[i] = (c + 0.5) * pitch
+            cells.y[i] = (r + 0.5) * pitch
+          }
         }
+        geo = { ...INK_GEO, minRadius: pitch * INK_GEO.minRadius, maxRadius: pitch * INK_GEO.maxRadius }
+        detailGeo = { ...geo, minRadius: pitch * 0.18, maxRadius: pitch * 0.52 }
+        coat = new LiquidInk(cells, pitch, { radius: 0.54, attack: 0.055, release: 0.08 })
+        shadow = new LiquidInk(cells, pitch, { radius: 0.48, attack: 0.055, release: 0.08 })
+        rim = new LiquidInk(cells, pitch, { radius: 0.46, attack: 0.055, release: 0.08 })
+      }
+      // Cache the 1,440 unlit dots until the theme or canvas size changes.
+      if (panelDirty) {
+        panelDirty = false
+        panel.width = canvas.width
+        panel.height = canvas.height
+        panelCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        panelCtx.beginPath()
+        const r = Math.max(0.7, pitch * 0.17)
+        for (let i = 0; i < cells.count; i++) {
+          panelCtx.moveTo(cells.x[i] + r, cells.y[i])
+          panelCtx.arc(cells.x[i], cells.y[i], r, 0, Math.PI * 2)
+        }
+        panelCtx.fillStyle = palette[0]
+        panelCtx.fill()
       }
     }
 
-    const paint = (frame: PetFrame) => {
-      const grid = drawPet(frame)
+    const paint = (frame: PetFrame, dt = 0) => {
+      drawPet(frame)
       place()
-      const geo: InkGeometry = {
-        minRadius: INK_GEO.minRadius * pitch,
-        maxRadius: INK_GEO.maxRadius * pitch,
-        spread: INK_GEO.spread,
-        handleSize: INK_GEO.handleSize,
-        reach: INK_GEO.reach,
-        dryRadius: Math.max(0.7, INK_GEO.dryRadius * pitch),
-        diagonals: INK_GEO.diagonals,
-      }
-      for (let i = 0; i < grid.length; i++) {
-        cells.shade[i] = grid[i]
-        cells.fill[i] = INK[i]
-      }
       ctx.clearRect(0, 0, PET_W * pitch, PET_H * pitch)
-      paintInk(ctx, cells, geo, palette, DRY_SHADE)
-    }
-
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      const resting: PetFrame = { ...IDLE_FRAME, phase: 1, swing: 0.6, breathe: 1 }
-      redrawStill = () => paint(resting)
-      redrawStill()
-      return () => {
-        themeWatch.disconnect()
-        sizeWatch.disconnect()
+      ctx.drawImage(panel, 0, 0, PET_W * pitch, PET_H * pitch)
+      coat.paint(ctx, COAT, palette[LIT], dt)
+      shadow.paint(ctx, HEAD_SHADOW, palette[DIM], dt)
+      rim.paint(ctx, RIM, palette[HOT], dt)
+      for (let i = 0; i < cells.count; i++) {
+        details.x[i] = cells.x[i] + DETAIL_X[i] * pitch
+        details.y[i] = cells.y[i] + DETAIL_Y[i] * pitch
       }
+      paintInk(ctx, details, detailGeo, palette)
     }
 
-    let raf = 0
     let raw = 0
     let smoothed = 0
     let bobAvg = 0
@@ -290,23 +282,15 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
     let gazeX = 0
     let gazeY = 0
     let affection = 0
-    let shownMood: PetMood | null = null
-    let last = performance.now()
-    let nextBlink = last + 2600
+    let nextBlink = performance.now() + 2600
     let blinkUntil = 0
 
-    const tick = (now: number) => {
-      raf = requestAnimationFrame(tick)
-      const since = now - last
-      if (since < MIN_FRAME_MS) return
-      const dt = Math.min(0.1, since / 1000)
-      last = now
-
+    const tick = (now: number, dt: number) => {
       // fast attack, slow release - the head drops on the beat and comes back
       // up between them, instead of vibrating at frame rate. the pre-filter
       // strips the frame-to-frame fizz off the measurement first, so the
       // envelope rides the music rather than the noise floor of the analyser.
-      const level = Math.min(1, levelRef.current() * 4)
+      const level = playingRef.current ? Math.min(1, levelRef.current() * 4) : 0
       raw += (level - raw) * (1 - Math.exp(-dt / LEVEL_SMOOTH))
       smoothed +=
         (raw - smoothed) *
@@ -315,7 +299,6 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
       groove += (wants - groove) * (1 - Math.exp(-dt / GROOVE_FOLLOW))
 
       // ---- where the cat is looking ----
-      const rect = canvas.getBoundingClientRect()
       const pointer = pointerRef.current
       const watching = pointer !== null && Date.now() - pointer.at < ATTENTION_MS
       let wantX: number
@@ -323,6 +306,7 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
       let onCat = false
 
       if (watching && pointer) {
+        const rect = canvas.getBoundingClientRect()
         // saturating, so the cursor two panels away and the cursor ten look the
         // same - past a certain point a head is simply turned as far as it goes
         const eyeX = rect.left + ((EYE_C + 0.5) / PET_W) * rect.width
@@ -378,20 +362,20 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
           // back and comes down again. a decaying wobble rather than a square
           // wave - an ear that snaps between two positions three times reads
           // as a fault in the panel.
-          twitch = Math.max(0, Math.exp(-secs * 4) * Math.cos(secs * 13))
+          twitch = smoothstep(0, 0.08, secs) * Math.max(0, Math.exp(-secs * 4) * Math.cos(secs * 13))
         } else if (reaction.kind === "pet") {
           // being fussed. this used to be a hop, which is what a cat does when
           // you drop something, not when you put your hand on it. a pat
           // presses the loaf down into the ground and it springs most of the
           // way back - the cosine going briefly negative is that rebound.
           mood = "purr"
-          pat = Math.max(-0.35, Math.exp(-secs * 4.5) * Math.cos(secs * 7.5))
+          pat = smoothstep(0, 0.1, secs) * Math.max(-0.35, Math.exp(-secs * 4.5) * Math.cos(secs * 7.5))
         } else {
           mood = reaction.kind === "clear" ? "cheer" : "happy"
           sparkle = 1 - t
           // one hop for a task, three for clearing the board
           const hops = reaction.kind === "clear" ? 3 : 1
-          hop = Math.max(0, Math.sin(t * Math.PI * hops))
+          hop = Math.sin(t * Math.PI * hops) ** 2
         }
       }
 
@@ -404,11 +388,6 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         else if (focusRef.current) mood = "focus"
         else if (playingRef.current) mood = "bop"
         else if (idleFor > 45_000) mood = "sleep"
-      }
-
-      if (mood !== shownMood) {
-        shownMood = mood
-        setCaption(CAPTIONS[mood])
       }
 
       const bob = playingRef.current ? Math.min(1, smoothed * 1.6) : 0
@@ -445,12 +424,13 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
         gazeX,
         gazeY,
         affection,
-      })
+      }, dt)
     }
-    raf = requestAnimationFrame(tick)
+    const resting: PetFrame = { ...IDLE_FRAME, phase: 1, swing: 0.6, breathe: 1 }
+    loop = canvasLoop(canvas, tick, () => paint(resting))
 
     return () => {
-      cancelAnimationFrame(raf)
+      loop?.dispose()
       themeWatch.disconnect()
       sizeWatch.disconnect()
     }
@@ -496,17 +476,14 @@ export function Pet({ signal, focus, playing, getLevel }: PetProps) {
   }, [])
 
   return (
-    <div className="flex w-full flex-col gap-3">
-      <div className="flex items-baseline justify-between">
-        <span className="label">Companion</span>
-        <span className="label">{caption}</span>
-      </div>
-      <div className="pet-stage mx-auto w-full max-w-[18rem] p-2">
-        {/* the pitch is measured off this, so it carries no padding of its own */}
-        <div ref={wrapRef} className="flex justify-center">
-          <canvas ref={canvasRef} aria-hidden />
-        </div>
-      </div>
+    <div
+      ref={wrapRef}
+      className="pet-stage"
+      style={{ aspectRatio: `${PET_W} / ${PET_H}` }}
+      role="img"
+      aria-label="A relaxing animated cat"
+    >
+      <canvas ref={canvasRef} aria-hidden />
     </div>
   )
 }

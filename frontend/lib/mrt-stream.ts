@@ -60,8 +60,8 @@ interface Reservoir {
 // time the backend says it is rendering.
 //
 // A buffer cannot repair a renderer that is permanently below 1x; it can only
-// postpone the gap. Keep latency below a second and let the backend lower one
-// codec layer when measured throughput actually needs it.
+// postpone the gap. Start healthy streams below a second; add bounded jitter
+// slack only after an audible gap, and let the backend adjust measured cost.
 function reservoirFor(realtimeFactor: number): Reservoir {
   if (realtimeFactor <= 0) {
     return { prebufferSeconds: 0.8, rebufferSeconds: 0.8, comfortSeconds: 1.6, minRate: 1 }
@@ -77,29 +77,18 @@ function reservoirFor(realtimeFactor: number): Reservoir {
 
 const WORKLET_URL = "/mrt-pcm-worklet.js"
 const RING_SECONDS = 8
+const GAP_MARGIN_SECONDS = 0.2
+const MAX_GAP_MARGIN_SECONDS = 0.8
 const FATAL_SERVER_CLOSE_CODES = new Set([1002, 1003, 1007, 1008, 1011])
 const SESSION_MAX_AGE_MS = 4 * 60 * 1000
 
 // The model's PCM is deliberately conservative: its int16 stage applies a
 // fixed 0.5 gain (about -6 dB) for headroom, so program RMS lands around
 // -21 to -26 dBFS. That known constant is undone by a fixed makeup stage.
-// The adaptive part is only a small station-leveling trim around it, and it
-// moves on a scale of minutes. An earlier version instead adapted over a
-// +9 dB range fast enough to follow musical dynamics: every mellow passage
-// ratcheted the gain up, which lifted the codec/model noise floor with it,
-// and listeners heard a session that slowly developed background hiss. The
-// music's quiet moments are dynamics to preserve, not miscalibration to
-// correct, and the noise floor must never depend on how quiet the last few
-// phrases were.
-const LOUDNESS_TARGET_DBFS = -18
+// Keep this gain fixed. Even a bounded +3 dB adaptive trim gradually raises
+// the model/codec noise floor during mellow passages. Musical dynamics should
+// not change the playback gain, and a fixed stage needs no analyser or polling.
 const MAKEUP_GAIN_DB = 5
-const NORMALIZER_MIN_DB = -3
-const NORMALIZER_MAX_DB = 3
-const NORMALIZER_STEP_UP_DB = 0.2
-const NORMALIZER_STEP_DOWN_DB = 0.75
-const LOUDNESS_POLL_MS = 1000
-const LOUDNESS_SMOOTHING = 0.03
-const MIN_NORMALIZE_POWER = 10 ** (-48 / 10)
 
 class SinkBuildCancelled extends Error {}
 
@@ -160,10 +149,6 @@ function clearSessionId() {
   } catch {
     // private browsing - there is no persistent session to clear
   }
-}
-
-function clamp(value: number, low: number, high: number): number {
-  return Math.max(low, Math.min(high, value))
 }
 
 function normalizedControls(
@@ -274,6 +259,7 @@ class TimerSink implements PcmSink {
   private playing = false
   private want = false
   private need: number
+  private fresh = true
   private ticker: ReturnType<typeof setInterval>
   private reservoir = reservoirFor(0)
   private disposed = false
@@ -318,6 +304,7 @@ class TimerSink implements PcmSink {
     if (this.disposed) return
     this.want = true
     if (!this.playing) {
+      this.fresh = fresh
       this.need = fresh
         ? this.reservoir.prebufferSeconds
         : this.reservoir.rebufferSeconds
@@ -337,13 +324,16 @@ class TimerSink implements PcmSink {
     this.queue = []
     this.queuedSeconds = 0
     this.playing = false
+    this.fresh = true
     this.need = this.reservoir.prebufferSeconds
   }
 
   configure(reservoir: Reservoir) {
     if (this.disposed) return
     this.reservoir = reservoir
-    if (!this.playing) this.need = reservoir.prebufferSeconds
+    if (!this.playing) {
+      this.need = this.fresh ? reservoir.prebufferSeconds : reservoir.rebufferSeconds
+    }
   }
 
   dispose() {
@@ -379,12 +369,16 @@ class TimerSink implements PcmSink {
       if (!this.playing) {
         if (buffered >= this.need) {
           this.playing = true
-          this.nextStart = this.ctx.currentTime + 0.05
+          // Pausing suspends the context with already-scheduled sources still
+          // queued. Continue after their end; moving this cursor back would
+          // overlap the next chunk with them when playback resumes.
+          this.nextStart = Math.max(this.nextStart, this.ctx.currentTime + 0.05)
           this.fadeTo(1)
         }
       } else if (this.queuedSeconds <= 0 && this.nextStart - this.ctx.currentTime < 0.15) {
         this.fadeTo(0)
         this.playing = false
+        this.fresh = false
         this.need = this.reservoir.rebufferSeconds
         this.onStarved()
       }
@@ -407,6 +401,8 @@ class TimerSink implements PcmSink {
       this.nextStart += buffer.duration
       this.scheduled.push(source)
       source.onended = () => {
+        source.onended = null
+        source.disconnect()
         this.scheduled = this.scheduled.filter((node) => node !== source)
       }
     }
@@ -421,11 +417,13 @@ class TimerSink implements PcmSink {
 
   private stopScheduled() {
     for (const source of this.scheduled) {
+      source.onended = null
       try {
         source.stop()
       } catch {
         // already finished
       }
+      source.disconnect()
     }
     this.scheduled = []
     this.nextStart = 0
@@ -437,18 +435,13 @@ export class MrtStream {
   private ctx: AudioContext | null = null
   private sink: PcmSink | null = null
   private sinkReady: Promise<PcmSink> | null = null
-  private inputMeter: AnalyserNode | null = null
-  private normalizer: GainNode | null = null
+  private makeup: GainNode | null = null
   private limiter: DynamicsCompressorNode | null = null
   private ceiling: GainNode | null = null
   private gain: GainNode | null = null
   private analyser: AnalyserNode | null = null
-  private loudnessBuffer: Float32Array = new Float32Array(0)
   private levelBuffer: Uint8Array = new Uint8Array(0)
   private freqBuffer: Uint8Array = new Uint8Array(0)
-  private loudnessTimer: ReturnType<typeof setInterval> | null = null
-  private smoothedPower: number | null = null
-  private normalizerDb = 0
 
   private sampleRate = 48000
   private channels = 2
@@ -462,6 +455,7 @@ export class MrtStream {
   private activeSessionId: string | null = null
   private lastSessionPersistedAt = 0
   private realtimeFactor = 0
+  private recoveryMarginSeconds = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private suspendTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectDelay = 500
@@ -562,6 +556,7 @@ export class MrtStream {
     this.requestedSessionId = null
     this.activeSessionId = null
     this.pendingPcm = []
+    this.resetRecoveryMargin()
     this.sink?.reset()
     this.awaitingVariation = true
     this.patch({
@@ -633,11 +628,6 @@ export class MrtStream {
       clearTimeout(this.suspendTimer)
       this.suspendTimer = null
     }
-    if (this.loudnessTimer) {
-      clearInterval(this.loudnessTimer)
-      this.loudnessTimer = null
-    }
-
     const sink = this.sink
     const pendingSink = this.sinkReady
     this.sink = null
@@ -655,23 +645,18 @@ export class MrtStream {
     }
 
     this.pendingPcm = []
-    this.inputMeter?.disconnect()
-    this.normalizer?.disconnect()
+    this.makeup?.disconnect()
     this.limiter?.disconnect()
     this.ceiling?.disconnect()
     this.gain?.disconnect()
     this.analyser?.disconnect()
-    this.inputMeter = null
-    this.normalizer = null
+    this.makeup = null
     this.limiter = null
     this.ceiling = null
     this.gain = null
     this.analyser = null
-    this.loudnessBuffer = new Float32Array(0)
     this.levelBuffer = new Uint8Array(0)
     this.freqBuffer = new Uint8Array(0)
-    this.smoothedPower = null
-    this.normalizerDb = 0
 
     const ctx = this.ctx
     this.ctx = null
@@ -696,17 +681,10 @@ export class MrtStream {
     // cursor resamples for free on its way out
     const ctx = new AudioContext({ sampleRate: this.sampleRate })
 
-    const inputMeter = ctx.createAnalyser()
-    // Roughly 680ms at 48k. The normalizer polls this only once a second and
-    // smooths power over many polls, so it responds to a quiet master rather
-    // than individual kicks and snares.
-    inputMeter.fftSize = 32768
-    inputMeter.smoothingTimeConstant = 0
-
-    const normalizer = ctx.createGain()
+    const makeup = ctx.createGain()
     // The fixed makeup applies immediately: restoring the codec's known -6 dB
     // headroom is not something to converge toward over a minute.
-    normalizer.gain.value = dbToGain(MAKEUP_GAIN_DB)
+    makeup.gain.value = dbToGain(MAKEUP_GAIN_DB)
 
     const limiter = ctx.createDynamicsCompressor()
     limiter.threshold.value = -2.5
@@ -731,82 +709,21 @@ export class MrtStream {
     // ever sees them
     analyser.smoothingTimeConstant = 0.55
 
-    inputMeter.connect(normalizer)
-    normalizer.connect(limiter)
+    makeup.connect(limiter)
     limiter.connect(ceiling)
     ceiling.connect(gain)
     gain.connect(analyser)
     analyser.connect(ctx.destination)
 
     this.ctx = ctx
-    this.inputMeter = inputMeter
-    this.normalizer = normalizer
+    this.makeup = makeup
     this.limiter = limiter
     this.ceiling = ceiling
     this.gain = gain
     this.analyser = analyser
-    this.loudnessBuffer = new Float32Array(inputMeter.fftSize)
     this.levelBuffer = new Uint8Array(analyser.fftSize)
     this.freqBuffer = new Uint8Array(analyser.frequencyBinCount)
-    this.loudnessTimer = setInterval(() => this.updateLoudness(), LOUDNESS_POLL_MS)
     return ctx
-  }
-
-  private updateLoudness() {
-    const meter = this.inputMeter
-    const normalizer = this.normalizer
-    const ctx = this.ctx
-    if (
-      !meter ||
-      !normalizer ||
-      !ctx ||
-      ctx.state !== "running" ||
-      !this.wantsAudio ||
-      !this.backendActive ||
-      this.awaitingVariation
-    ) {
-      return
-    }
-
-    if (this.loudnessBuffer.length !== meter.fftSize) {
-      this.loudnessBuffer = new Float32Array(meter.fftSize)
-    }
-    meter.getFloatTimeDomainData(this.loudnessBuffer)
-    let power = 0
-    for (let i = 0; i < this.loudnessBuffer.length; i++) {
-      const sample = this.loudnessBuffer[i]
-      power += sample * sample
-    }
-    power /= this.loudnessBuffer.length
-
-    // Do not chase pauses, dropouts, or a sparse intro up to maximum gain.
-    if (!Number.isFinite(power) || power < MIN_NORMALIZE_POWER) return
-    this.smoothedPower =
-      this.smoothedPower === null
-        ? power
-        : this.smoothedPower * (1 - LOUDNESS_SMOOTHING) + power * LOUDNESS_SMOOTHING
-
-    const measuredDb = 10 * Math.log10(this.smoothedPower)
-    // normalizerDb is the small trim around the fixed makeup, not the whole
-    // gain. Its bounds are what bound how far the noise floor can ever rise.
-    const wantedDb = clamp(
-      LOUDNESS_TARGET_DBFS - MAKEUP_GAIN_DB - measuredDb,
-      NORMALIZER_MIN_DB,
-      NORMALIZER_MAX_DB,
-    )
-    const delta = clamp(
-      wantedDb - this.normalizerDb,
-      -NORMALIZER_STEP_DOWN_DB,
-      NORMALIZER_STEP_UP_DB,
-    )
-    if (Math.abs(delta) < 0.01) return
-
-    this.normalizerDb += delta
-    normalizer.gain.setTargetAtTime(
-      dbToGain(MAKEUP_GAIN_DB + this.normalizerDb),
-      ctx.currentTime,
-      3,
-    )
   }
 
   private ensureSink(): Promise<PcmSink> {
@@ -833,7 +750,7 @@ export class MrtStream {
 
   private async buildSink(generation: number): Promise<PcmSink> {
     const ctx = this.ensureContext()
-    const reservoir = reservoirFor(this.realtimeFactor)
+    const reservoir = this.currentReservoir()
     const isCurrent = () =>
       !this.destroyed && generation === this.sinkGeneration && this.ctx === ctx
 
@@ -873,13 +790,13 @@ export class MrtStream {
       sink.configure(reservoir)
     }
 
-    if (!isCurrent() || !this.inputMeter) {
+    if (!isCurrent() || !this.makeup) {
       sink.dispose()
       throw new SinkBuildCancelled("sink build was superseded")
     }
-    sink.output.connect(this.inputMeter)
+    sink.output.connect(this.makeup)
     // Status may have arrived while the worklet module was compiling.
-    sink.configure(reservoirFor(this.realtimeFactor))
+    sink.configure(this.currentReservoir())
     this.sink = sink
     for (const pcm of this.pendingPcm.splice(0)) sink.push(pcm)
     return sink
@@ -925,8 +842,30 @@ export class MrtStream {
     }
   }
 
+  private currentReservoir(): Reservoir {
+    const base = reservoirFor(this.realtimeFactor)
+    return {
+      ...base,
+      prebufferSeconds: base.prebufferSeconds + this.recoveryMarginSeconds,
+      rebufferSeconds: base.rebufferSeconds + this.recoveryMarginSeconds,
+      comfortSeconds: base.comfortSeconds + this.recoveryMarginSeconds,
+    }
+  }
+
+  private resetRecoveryMargin() {
+    this.recoveryMarginSeconds = 0
+    this.sink?.configure(this.currentReservoir())
+  }
+
   private onStarved() {
-    // only the client knows a gap was audible, so it is the one that reports it
+    if (!this.wantsAudio || !this.backendActive || this.awaitingVariation) return
+    // Learn only from audible underruns. Bounded recovery slack absorbs real
+    // packet/render jitter without adding latency to a healthy first start.
+    this.recoveryMarginSeconds = Math.min(
+      MAX_GAP_MARGIN_SECONDS,
+      this.recoveryMarginSeconds + GAP_MARGIN_SECONDS,
+    )
+    this.sink?.configure(this.currentReservoir())
     this.send({ type: "gap" })
   }
 
@@ -1035,6 +974,9 @@ export class MrtStream {
       case "hello": {
         const id = typeof message.sessionId === "string" ? message.sessionId : ""
         const resumed = message.resumed === true
+        if (!resumed || (this.activeSessionId && id !== this.activeSessionId)) {
+          this.resetRecoveryMargin()
+        }
         // Older servers reused a missing/expired ID for a newly seeded session.
         // Ask the upgraded server for a genuinely fresh identity if that stale
         // echo is ever observed.
@@ -1085,7 +1027,7 @@ export class MrtStream {
         this.requestedSessionId = null
         this.awaitingVariation = false
         this.pendingPcm = []
-        this.smoothedPower = null
+        this.resetRecoveryMargin()
         this.sink?.reset()
         if (this.wantsAudio) this.sink?.play(true)
         this.patch({
@@ -1104,13 +1046,12 @@ export class MrtStream {
         const preserveGenerationError =
           this.state.status === "error" && !this.backendActive && !this.awaitingVariation
 
-        const factor = (message.realtimeFactor as number) ?? 0
-        if (factor > 0 && Math.abs(factor - this.realtimeFactor) > 0.05) {
-          // the backend has told us how fast it really renders; size the
-          // reservoir to match rather than making every machine pay for the
-          // slowest one
+        const factor = message.realtimeFactor
+        if (typeof factor === "number" && Number.isFinite(factor) && factor > 0) {
+          // Even a small change can cross a reservoir policy boundary. Retain
+          // the measured factor and the jitter margin on every valid update.
           this.realtimeFactor = factor
-          this.sink?.configure(reservoirFor(factor))
+          this.sink?.configure(this.currentReservoir())
         }
 
         if (this.backendActive && !wasActive && this.wantsAudio) {

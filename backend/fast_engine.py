@@ -23,6 +23,11 @@ never expanded):
   skipped-codebook dummy tokens, and the CFG/delay bookkeeping that never
   varies on the live path are built once instead of per frame (exactly
   equal).
+- synthesis-window cache: the codec's inverse-STFT window is constant, but
+  upstream rebuilds it on the GPU and copies it to NumPy every frame. Reuse
+  the original window so that CPU readback no longer synchronizes each
+  streaming step in the middle of the asynchronous frame pipeline (exactly
+  equal).
 
 It also repairs quality truncation. Upstream pads skipped codebooks with
 each codebook's code 0, and the SpectroStream RVQ then *sums those
@@ -43,6 +48,7 @@ import inspect
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +79,7 @@ class FastEngineStatus:
     sliced_logits: bool = False
     cached_encoder: bool = False
     truncation_decode_fix: bool = False
+    cached_synthesis_window: bool = False
 
     def summary(self) -> str:
         parts = []
@@ -84,6 +91,8 @@ class FastEngineStatus:
             parts.append("cached conditioning encoder")
         if self.truncation_decode_fix:
             parts.append("clean RVQ truncation")
+        if self.cached_synthesis_window:
+            parts.append("cached synthesis window")
         return ", ".join(parts) if parts else "nothing installed"
 
 
@@ -124,8 +133,12 @@ def _build_projector(to_logits, decoder_config, mx):
         if weight.shape[0] != vocab:
             return None
         group_size, bits = linear.group_size, linear.bits
-        mode = getattr(linear, "mode", "affine")
-        supports_mode = "mode" in inspect.signature(mx.quantized_matmul).parameters
+        # MLX exposes quantized_matmul through nanobind; inspect.signature
+        # raises on the pinned 0.32.2 build. Mirror QuantizedLinear's own
+        # mode attribute instead: versions with this attribute pass it to
+        # the native call, while older affine-only versions omit the keyword.
+        mode = getattr(linear, "mode", None)
+        matmul_kwargs = {"mode": mode} if mode is not None else {}
         add_bias = "bias" in linear
         bias = linear["bias"] if add_bias else None
         for index in range(decoder_config.num_codebooks):
@@ -142,7 +155,6 @@ def _build_projector(to_logits, decoder_config, mx):
 
         def project(values, index):
             w, s, b, bias_slice = slices[index]
-            kwargs = {"mode": mode} if supports_mode else {}
             y = mx.quantized_matmul(
                 values.astype(compute_dtype),
                 w,
@@ -151,7 +163,7 @@ def _build_projector(to_logits, decoder_config, mx):
                 transpose=True,
                 group_size=group_size,
                 bits=bits,
-                **kwargs,
+                **matmul_kwargs,
             )
             if bias_slice is not None:
                 y = y + bias_slice
@@ -279,6 +291,9 @@ def install(system, mx, sl) -> FastEngineStatus | None:
 
     status = FastEngineStatus()
     status.truncation_decode_fix = _install_truncation_fix(sampler, config, sl)
+    status.cached_synthesis_window = _cache_synthesis_windows(
+        sampler.spectrostream, sl
+    )
 
     prefix_layers = list(decoder.depth_body.layers[:-1])
     projector = _build_projector(decoder.depth_body.layers[-1], config, mx)
@@ -440,6 +455,38 @@ def install(system, mx, sl) -> FastEngineStatus | None:
     status.step_specialized = True
     log.info("fast engine installed: %s", status.summary())
     return status
+
+
+def _cache_synthesis_windows(spectrostream, sl) -> bool:
+    """Compute the codec's immutable inverse-STFT window once per instance.
+
+    SequenceLayers' inverse_stft_window_fn rebuilds this constant on the GPU
+    and copies it to NumPy on every frame. That copy synchronizes the GPU in
+    the middle of sampler.step, defeating asynchronous frame evaluation.
+    Reusing the original window removes that barrier without changing its
+    arithmetic, the overlap-add state, or a single decoded sample.
+    """
+    installed = False
+    for _, layer in spectrostream.named_modules():
+        if not isinstance(layer, sl.InverseSTFT):
+            continue
+        window_fn = layer._window_fn
+        if getattr(window_fn, "_lofai_cached_window", False):
+            installed = True
+            continue
+        # Cache only the known pure function, never an arbitrary user window
+        # whose output could change between calls.
+        if (
+            getattr(window_fn, "__module__", None) != "sequence_layers.mlx.signal"
+            or getattr(window_fn, "__name__", None) != "inverse_stft_window_fn_inner"
+        ):
+            continue
+        cached = lru_cache(maxsize=4)(window_fn)
+        cached(layer._frame_length)
+        cached._lofai_cached_window = True
+        layer._window_fn = cached
+        installed = True
+    return installed
 
 
 def _install_truncation_fix(sampler, decoder_config, sl) -> bool:

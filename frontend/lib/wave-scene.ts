@@ -26,7 +26,7 @@ export const SPOKES = 18
 // so the panel has somewhere to go on a loud bar instead of being most of the
 // way full before the music starts.
 const REST_OUT = 0.04
-const LOUD_OUT = 1.0
+const LOUD_OUT = 1 - REST_OUT
 
 // a blob's field keeps climbing for a way past its own radius, because the
 // neighbours either side are still adding to it out there. this is where the
@@ -51,6 +51,8 @@ const OVERSHOOT = 1.14
 const FUSE = 0.6
 
 const TAU = Math.PI * 2
+const COS = Float32Array.from({ length: SPOKES }, (_, s) => Math.cos(s / SPOKES * TAU))
+const SIN = Float32Array.from({ length: SPOKES }, (_, s) => Math.sin(s / SPOKES * TAU))
 
 export { SURFACE }
 
@@ -82,14 +84,12 @@ export function buildWave(blobs: BlobSet, amp: Float32Array, geo: WaveGeometry) 
   const minR = ((TAU * geo.inner) / SPOKES) * FUSE
 
   for (let s = 0; s < SPOKES; s++) {
-    const a = (s / SPOKES) * TAU
-
     // the radius the surface is to reach on this spoke, and the blob that puts
     // it there: wide enough to fill from the lip out to the crest, then walked
     // back in by however far its own field overshoots
-    const crest = geo.inner + geo.span * (REST_OUT + amp[s] * LOUD_OUT)
+    const crest = geo.inner + geo.span * (REST_OUT + Math.max(0, Math.min(1, amp[s])) * LOUD_OUT)
     const r = Math.max(minR, (crest - lip) * 0.5)
     const d = crest - r * OVERSHOOT
-    blobs.add(Math.cos(a) * d, Math.sin(a) * d, r)
+    blobs.add(COS[s] * d, SIN[s] * d, r)
   }
 }

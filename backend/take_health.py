@@ -13,10 +13,11 @@ duration, so this is a per-take failure, not a constant.
 ``TakeFloorMonitor`` watches the stream the listener actually receives. It
 profiles the quietest blocks - the gaps between notes, where a hiss bed is
 exposed - and compares a frozen early-take baseline against a trailing
-window. Both the overall gap floor and its high-band level must rise
-together, sustained for several seconds, before it reports drift: musical
-passages getting denser moves the gap floor but not, in this genre, its
-high band. The repair is a server-side equal-power crossfade onto a fresh
+window. Its high-band level must become audibly louder and stay there before
+it reports drift. The overall floor is diagnostic: a bed can brighten well
+before its total level changes. Stereo power is measured before combining
+channels, so wide or opposite-phase noise cannot disappear in a mono fold.
+The repair is a server-side equal-power crossfade onto a fresh
 recurrent state (same station, new seed), which reads as a radio track
 change rather than a dropout: PCM flow, session identity, and the client
 transport are untouched.
@@ -56,10 +57,13 @@ TRAILING_SECONDS = 60.0
 # briefly reached +17 dB and receded within a window.
 HIGH_BAND_RISE_DB = 10.0
 MIN_AUDIBLE_HIGH_DBFS = -52.0
-# Drift must hold in most chunk evaluations across this window. A fraction
+# Drift must hold in most evaluations across this audio-time window. A fraction
 # over a window, not a consecutive streak: one quiet evaluation must not
-# reset the clock on a take that has been hissing for a minute.
-SUSTAIN_WINDOW_CHUNKS = 100
+# reset the clock on a take that has been hissing for a minute. Measuring
+# generated audio time also keeps this independent of chunk size, transport
+# fragmentation, pauses, or repeated empty input.
+EVALUATION_SECONDS = 0.4
+SUSTAIN_SECONDS = 40.0
 SUSTAIN_FRACTION = 0.8
 
 HIGH_BAND_LOW_HZ = 5_000.0
@@ -83,7 +87,7 @@ def _floor_profile(rms_values, high_values) -> tuple[float, float]:
     rms = np.asarray(rms_values, dtype=np.float64)
     high = np.asarray(high_values, dtype=np.float64)
     take = max(1, int(rms.size * FLOOR_PERCENTILE / 100.0))
-    quiet = np.argsort(rms)[:take]
+    quiet = np.argpartition(rms, take - 1)[:take]
     return float(np.median(rms[quiet])), float(np.median(high[quiet]))
 
 
@@ -99,8 +103,11 @@ class TakeFloorMonitor:
         self._baseline_floor: float | None = None
         self._baseline_high_floor: float | None = None
         self._seen_blocks = 0
-        self._drift_votes: deque[bool] = deque(maxlen=SUSTAIN_WINDOW_CHUNKS)
-        self._remainder = np.empty(0, dtype=np.float32)
+        self._evaluation_blocks = max(1, round(EVALUATION_SECONDS / BLOCK_SECONDS))
+        self._drift_votes: deque[bool] = deque(
+            maxlen=max(1, round(SUSTAIN_SECONDS / EVALUATION_SECONDS))
+        )
+        self._remainder = np.empty((0, CHANNELS), dtype=np.float32)
         window = np.hanning(BLOCK_FRAMES).astype(np.float32)
         self._window = window
         freqs = np.fft.rfftfreq(BLOCK_FRAMES, 1.0 / SAMPLE_RATE)
@@ -116,26 +123,31 @@ class TakeFloorMonitor:
         frame_bytes = 2 * CHANNELS
         usable_bytes = len(pcm) - (len(pcm) % frame_bytes)
         if usable_bytes <= 0:
-            self._evaluate()
             return
-        samples = np.frombuffer(pcm[:usable_bytes], dtype=np.int16)
-        mono = (
-            samples.reshape(-1, CHANNELS).mean(axis=1, dtype=np.float32) / 32768.0
+        samples = (
+            np.frombuffer(pcm[:usable_bytes], dtype="<i2")
+            .reshape(-1, CHANNELS)
+            .astype(np.float32)
+            / 32768.0
         )
         if self._remainder.size:
-            mono = np.concatenate([self._remainder, mono])
-        usable = mono.size // BLOCK_FRAMES * BLOCK_FRAMES
-        self._remainder = mono[usable:]
+            samples = np.concatenate([self._remainder, samples])
+        usable = len(samples) // BLOCK_FRAMES * BLOCK_FRAMES
+        # A short leftover must not retain a view of a potentially long take.
+        self._remainder = samples[usable:].copy()
         if usable:
-            blocks = mono[:usable].reshape(-1, BLOCK_FRAMES)
-            rms = np.sqrt(np.mean(blocks**2, axis=1) + _EPS)
-            spectra = np.abs(np.fft.rfft(blocks * self._window, axis=1)) ** 2
+            blocks = samples[:usable].reshape(-1, BLOCK_FRAMES, CHANNELS)
+            rms = np.sqrt(np.mean(blocks**2, axis=(1, 2)) + _EPS)
+            spectra = np.abs(
+                np.fft.rfft(blocks * self._window[None, :, None], axis=1)
+            ) ** 2
             high = np.sqrt(
-                np.sum(spectra[:, self._high_bins], axis=1) * self._fft_scale + _EPS
+                np.mean(np.sum(spectra[:, self._high_bins, :], axis=1), axis=1)
+                * self._fft_scale
+                + _EPS
             )
             for block_rms, block_high in zip(rms, high):
                 self._observe_block(float(block_rms), float(block_high))
-        self._evaluate()
 
     def _observe_block(self, rms: float, high: float):
         self._seen_blocks += 1
@@ -154,6 +166,8 @@ class TakeFloorMonitor:
             self._baseline_high = []
         self._trailing_rms.append(rms)
         self._trailing_high.append(high)
+        if self._seen_blocks % self._evaluation_blocks == 0:
+            self._evaluate()
 
     def _evaluate(self):
         if (

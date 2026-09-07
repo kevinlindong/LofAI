@@ -10,8 +10,8 @@ that release and Google's current model/core documentation.
 MRT2 is a streaming codec language model, not a prompt-to-song renderer. Every
 40 ms it repeats this causal loop:
 
-1. MusicCoCa maps a short text prompt or reference audio to a 768-dimensional
-   style embedding and then to 12 style tokens.
+1. MusicCoCa supplies 12 style tokens from a 768-dimensional text/audio
+   embedding. lofAI caches this work until the style changes.
 2. Optional MIDI supplies the current state of 128 pitches; an optional drum
    token supplies a coarse drum condition.
 3. A decoder-only Transformer reads those controls plus its recurrent audio
@@ -51,7 +51,7 @@ bounded server outbox -> WebSocket -> 8 s AudioWorklet ring
                                       |
                                 ~0.6-0.9 s start bank
                                       |
-                         loudness gain -> limiter -> speakers
+                         fixed makeup -> limiter -> speakers
 ```
 
 There is one loaded model and one MLX-owning worker thread. Each listener keeps
@@ -96,6 +96,103 @@ the real-time hot loop.
 outside that table: they support offline listening experiments, not playback.
 
 ## What made the previous stream slow
+
+### September 2026 audit of the installed runtime
+
+The optimized step was configured on but failed during installation:
+`inspect.signature(mx.quantized_matmul)` raises `TypeError` on MLX 0.32.2's
+native nanobind function. The exception sent generation back to the stock
+step, disabling sliced projections, cached conditioning, and hoisted constants.
+The projector now reads the quantization mode from `QuantizedLinear`, matching
+the installed layer's own call. This enables the existing optimization on the
+actual pinned runtime rather than relying on its configuration flag.
+
+SpectroStream also rebuilt its constant inverse-STFT synthesis window with
+GPU operations and copied it to NumPy inside every frame. That readback
+synchronized the pipeline. Caching the original window once removes the
+repeated calculation and synchronization without changing its values.
+
+Two forward/reverse-order local comparisons on the 8 GB M1 used the small
+model, 8-bit weights, all 12 codebooks, 10-frame paced calls, GPU keepalive,
+and the 384 MB MLX cache cap. Each variant rendered 150 frames, excluding
+30 warmup frames from timing:
+
+| Configuration | Mean ms/frame, run 1 | Mean ms/frame, run 2 |
+|---|---:|---:|
+| Previous deployed fallback | 41.65 | 39.02 |
+| Enabled specialized step | 36.84 | 36.38 |
+| Specialized step + cached window | 36.20 | 36.29 |
+
+The combined average fell from 40.33 to 36.25 ms/frame (about 10% less render
+time, approximately 0.99x to 1.10x real time at full depth). The cached-window
+and uncached-specialized paths produced identical six-second seeded PCM in
+both comparisons. MLX active allocations were about 450 MB and reusable cache
+about 239 MB; these are MLX measurements, not total application memory or
+energy use. Host load and swap pressure affected timings. Adaptive 10–12
+codebooks remain enabled to obtain additional margin when full depth cannot
+meet the 1.18x target. An experimental compiled sampler was not retained:
+its smaller additional improvement was inconsistent.
+
+The old speed meter also used the median chunk cost. With two 30 ms frames
+and one 200 ms frame it reported 1.33x, even though total throughput was only
+0.46x. The meter now divides total generated audio by total rendering time,
+weighted correctly for unequal chunk sizes. The tuner can ignore one worst
+chunk to preserve quality through isolated jitter, but a deficit that remains
+for six seconds still causes a depth reduction. Admission and browser reservoir
+selection use the untrimmed measured throughput.
+
+An integrated 180-second source-audio capture then reproduced six simulated
+playback underruns on this host. Live inference RTF ranged from 0.705 to 1.188
+(median 1.108), despite the improved mean benchmark. Unpaused packet intervals
+reached 1.025 seconds. This exposed a separate client bug: its 0.05 RTF update
+deadband ignored a 1.203-to-1.157 change even though it crossed the 1.18 buffer
+policy boundary. Valid speed updates now always refresh the policy, and the
+server broadcasts speed every four seconds even when depth stays at its floor.
+Each audible underrun adds 0.2 seconds of recovery margin, capped at 0.8 extra
+seconds; the margin survives pauses and resets for a new take/session.
+
+Replaying the same packet arrivals with recorded periodic health measurements
+and the new bounded margin reduced interruptions from six to three. Total
+refill waits were 5.92 seconds versus 5.32 seconds: fewer, longer recoveries.
+Initial startup stayed unchanged and peak retained audio was 2.013 seconds.
+This is a fixed-trace simulation, not a second live performance or a guarantee
+of uninterrupted audio. A slower initial start did not reduce interruptions
+on that trace, so the initial reservoir defaults remain unchanged. No finite
+reservoir fixes sustained generation below 1x at the configured quality floor.
+
+A subsequent live 90-second capture verified periodic status, a station change,
+pause/resume, and the new margin cap. With heavier concurrent host activity,
+median reported render RTF was 0.975 at the 10-layer floor, unpaused packet
+intervals reached 1.637 seconds, and five simulated underruns required 13.57
+seconds of refill waits. Peak buffering remained bounded at 2.413 seconds.
+The server shut down cleanly after both captures. The new buffer policy cannot
+promise uninterrupted playback when the host cannot supply frames fast enough;
+the two live captures are not controlled before/after speed comparisons.
+
+Those checks exposed a scheduling mismatch: tool-launched Python's main
+thread had macOS user-interactive QoS, while a newly created Python worker
+had default QoS. A final paired comparison ran on a dedicated Python worker
+at 8-bit / 10 codebooks, alternating default and user-initiated QoS:
+
+| Worker priority | Forward mean ms/frame | Reverse mean ms/frame |
+|---|---:|---:|
+| Default | 39.88 | 52.63 |
+| User initiated | 37.97 | 39.85 |
+
+All four seeded 4.8-second outputs were identical. User-initiated was faster
+in both pairs, but the large final default-thread stall makes the aggregate
+15.9% improvement noisy. This effect must not be added to the earlier 10%
+figure or treated as an assurance of real-time performance under every load.
+The dedicated inference worker now requests user-initiated QoS before loading
+MLX, using Apple's supported per-thread API. Higher existing priority is
+preserved, failure falls back safely, and no other app's priority is changed.
+`MRT_WORKER_QOS=default` opts out; `/health` exposes `workerQoS`. This follows
+[Apple's guidance for work needed for an immediate user action](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/EnergyGuide-iOS/PrioritizeWorkWithQoS.html).
+The long live captures above preceded this scheduling change; the paired
+worker benchmark and regression tests validate it separately.
+
+The observations and tables below predate this audit and describe earlier
+configurations, not guaranteed throughput under the current machine load.
 
 The observed startup calibration was 71.8 ms per 40 ms frame, or 0.56x real
 time. A six-second prebuffer can hide that deficit for only about 14 seconds:
@@ -221,7 +318,7 @@ listener actually receives. A baseline floor profile is frozen over the
 take's first minute (after a short landing period); the high band (5-14
 kHz) of the trailing minute's floor must then rise at least 10 dB over its
 own baseline and clear an absolute audibility gate, in at least 80% of
-chunk evaluations across a 40-second window, before the take is declared
+evaluations across a 40-second audio window, before the take is declared
 drifted. The decision is deliberately spectral: a live-captured failure
 grew +22 dB of high-band hiss while its overall floor rose only +1 dB -
 the bed brightens long before it lifts - while a warm rumble or denser
@@ -237,17 +334,40 @@ and costs one borderline cymbal-wash passage a single crossfade. Station
 changes re-learn the baseline, since the recurrent state - and any drift
 it carries - survives them. `MRT_TAKE_GUARD=0` disables the guard.
 
+The September audit found that folding PCM to mono before measuring it hid
+opposite-phase stereo hiss. The monitor now averages channel powers instead,
+and evaluates every 400 ms of audio rather than once per incoming chunk.
+Chunk size and empty calls therefore cannot shorten or lengthen the sustain
+window. Small remainder buffers own their memory, and percentile selection
+uses partitioning instead of sorting. Synthetic tests reproduce both bugs;
+monitor overhead remains about 0.34 ms per 400 ms chunk on the local M1.
+The guard needs an early baseline: it does not remove hiss already present
+from the beginning or guarantee detection after a noisy style-change baseline.
+The affected station prompts no longer explicitly ask for vinyl or tape.
+
 **The client mastering chased dynamics.** The old loudness normalizer
 adapted over a +9 dB range fast enough to follow musical passages: every
 mellow stretch ratcheted the gain up - exactly when a floor is most
 audible - and the codec noise floor rose with it, up to +6.9 dB in
-simulation over a real take. It now applies the codec's known -6 dB int16
-headroom as an immediate fixed makeup stage and keeps only a ±3 dB
-station-leveling trim around it, moving slowly enough (minutes, not
-phrases) that the noise floor never depends on how quiet the last passage
-was. Simulated over the same take, worst-case floor lift drops from +6.9 to
-+5.2 dB with the same average loudness, and the gain no longer tracks the
-music's dynamics at all.
+simulation over a real take. A later ±3 dB trim still reached its maximum
+in about 15 seconds on quiet audio. The current graph removes that adaptive
+trim, its extra 32,768-sample analyser and its polling timer altogether.
+A fixed +5 dB makeup stage compensates for most of the codec's -6 dB int16
+headroom; the existing limiter, output ceiling, and listener volume remain.
+Music and any inherent noise are amplified equally by that fixed amount,
+without a gain increase as the take becomes quiet.
+
+The worklet now retains incoming new-take PCM while the previous take fades
+out, honors a pause during that transition, and fades at a ring overflow
+instead of silently omitting a packet and splicing later audio across the hole.
+At 48 kHz and unity playback speed, it reads each PCM sample directly instead
+of interpolating with a second ring read. Resampling retains one continuous
+fractional cursor when source and device rates differ.
+In a synthetic native-rate worklet benchmark, 80 seconds of stereo audio took
+28.4 ms of processing versus 314.6 ms before (five-run medians). This is the
+isolated DSP loop, not an estimate of overall app CPU or model speed. The
+timer-based compatibility sink also preserves its queued scheduling cursor
+across a pause so new chunks cannot overlap already scheduled audio.
 
 Batching still matters for the eager Python runtime:
 

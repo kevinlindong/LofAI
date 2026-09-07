@@ -108,7 +108,7 @@ class EvaluationSpecTests(unittest.TestCase):
 
         self.assertEqual(
             style.prompt,
-            "instrumental mellow lo-fi hip hop, dusty drums, warm jazz guitar, vinyl",
+            "instrumental mellow lo-fi hip hop, dusty drums, warm jazz guitar",
         )
         self.assertEqual(style.bpm, 76)
         self.assertEqual(style.groove, 0.62)

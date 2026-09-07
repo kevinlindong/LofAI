@@ -5,7 +5,7 @@ import { AsciiAmbience } from "@/components/ascii-ambience"
 import { MusicControls } from "@/components/music-controls"
 import { Pet, type PetEvent, type PetSignal } from "@/components/pet"
 import { PomodoroTimer } from "@/components/pomodoro-timer"
-import { ThemeToggle } from "@/components/theme-toggle"
+import { PageMenu } from "@/components/page-menu"
 import { TodoList } from "@/components/todo-list"
 import {
   DEFAULT_LISTENER_CONTROLS,
@@ -22,18 +22,6 @@ const IDLE_STATE: StreamState = {
   message: null,
   bufferProgress: 0,
   variationPending: false,
-}
-
-// the header carries the connection state; the transport carries the detail
-const SHORT_STATUS: Record<string, string> = {
-  idle: "standby",
-  connecting: "linking",
-  loading: "loading",
-  queued: "queued",
-  buffering: "buffering",
-  live: "on air",
-  paused: "held",
-  error: "fault",
 }
 
 function statusLabel(state: StreamState, wantsAudio: boolean): string {
@@ -136,45 +124,14 @@ export default function LofiGenerator() {
       <AsciiAmbience />
 
       <div className="app-frame">
-        <header className="app-header">
-          <div className="brand-lockup min-w-0">
-            <div className="brand-flow" aria-hidden>
-              <span />
-              <span />
-              <span />
-            </div>
-            <div className="min-w-0">
-              <h1 className="brand-name dot-type">LOFAI</h1>
-              <p className="brand-tagline hidden sm:block">endless lofi, shaped while it plays</p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            <span className="status-pill">
-              <span
-                className={`status-orb ${isLive ? "is-live" : ""}`}
-                style={{
-                  background: isLive
-                    ? "var(--good)"
-                    : streamState.status === "error"
-                      ? "var(--bad)"
-                      : "var(--text-faint)",
-                }}
-              />
-              <span className="hidden sm:inline">
-                {SHORT_STATUS[streamState.status] ?? "standby"}
-              </span>
-            </span>
-            <ThemeToggle />
-          </div>
-        </header>
+        <PageMenu />
 
         <div className="workspace-grid">
-          <section className="surface-card music-card">
+          <section id="radio" className="surface-card music-card" tabIndex={-1}>
             <div className="card-intro">
               <div>
                 <p className="eyebrow">Generative radio</p>
-                <h2>Find your flow.</h2>
+                <h1>Find your flow.</h1>
               </div>
               <p className="card-note hidden sm:block">A live soundtrack that changes with you.</p>
             </div>
@@ -203,11 +160,11 @@ export default function LofiGenerator() {
               />
             </section>
 
-            <section className="surface-card tasks-card">
+            <section id="tasks" className="surface-card tasks-card" tabIndex={-1}>
               <TodoList onEvent={handlePetEvent} />
             </section>
 
-            <section className="surface-card timer-card">
+            <section id="focus-timer" className="surface-card timer-card" tabIndex={-1}>
               <PomodoroTimer onRunningChange={setFocusMode} />
             </section>
           </div>

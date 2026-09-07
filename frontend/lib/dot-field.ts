@@ -25,6 +25,24 @@ const REACH = 2
 // the field value at the edge of a lone blob: (1 - 0.5²)³
 export const SURFACE = 0.421875
 
+export function smoothstep(from: number, to: number, value: number): number {
+  const t = Math.max(0, Math.min(1, (value - from) / (to - from)))
+  return t * t * (3 - 2 * t)
+}
+
+// Signed distance in grid cells, estimated from the local field gradient.
+// This keeps a soft edge one cell wide for both small ears and large waves.
+export function surfaceDistance(field: Float32Array, i: number, width: number): number {
+  const x = i % width
+  const left = x > 0 ? field[i - 1] : field[i]
+  const right = x + 1 < width ? field[i + 1] : field[i]
+  const above = i >= width ? field[i - width] : field[i]
+  const below = i + width < field.length ? field[i + width] : field[i]
+  const dx = (right - left) * 0.5
+  const dy = (below - above) * 0.5
+  return (field[i] - SURFACE) / Math.max(0.025, Math.sqrt(dx * dx + dy * dy))
+}
+
 // a set of blobs, gathered per frame and then sampled. the buffer is reused
 // between frames - at thirty frames a second a fresh array per frame is a
 // steady drip of garbage for no gain.
@@ -75,16 +93,17 @@ export class BlobSet {
   // scattering by bounding box rather than asking every cell about every blob
   // is the difference between a creature costing tens of thousands of distance
   // checks a frame and costing a few thousand.
-  scatter(field: Float32Array, w: number, h: number) {
+  scatter(field: Float32Array, w: number, h: number, pitch = 1, originX = 0, originY = 0) {
     field.fill(0)
     const d = this.data
     const end = this.count * 4
     for (let i = 0; i < end; i += 4) {
-      const cx = d[i]
-      const cy = d[i + 1]
-      const reach = d[i + 2]
+      const cx = (d[i] - originX) / pitch
+      const cy = (d[i + 1] - originY) / pitch
+      const reach = d[i + 2] / pitch
       const k = d[i + 3]
       const r2 = reach * reach
+      const inverseR2 = 1 / r2
       const x0 = Math.max(0, Math.ceil(cx - reach))
       const x1 = Math.min(w - 1, Math.floor(cx + reach))
       const y0 = Math.max(0, Math.ceil(cy - reach))
@@ -100,7 +119,7 @@ export class BlobSet {
           const dx = x - cx
           const q = dx * dx
           if (q >= spare) continue
-          const t = (spare - q) / r2
+          const t = (spare - q) * inverseR2
           field[base + x] += k * t * t * t
         }
       }

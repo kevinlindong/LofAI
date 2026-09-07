@@ -429,5 +429,44 @@ const membranes = (ops) => ops.filter((o) => o.op === "bezier")
     `${membranes(bondedPair.ops).length} bezier segments`)
 }
 
+// Reversing unequal neighbours must preserve the liquid shape and its reach.
+{
+  const a = stub(), b = stub()
+  const forward = connector(a, 0, 0, 2, 10, 0, 5, GEO)
+  const reverse = connector(b, 10, 0, 5, 0, 0, 2, GEO)
+  check("unequal neighbours join in either direction", forward && reverse)
+  check("unequal neighbours release in either direction",
+    !connector(stub(), 0, 0, 2, 12.3, 0, 5, GEO) &&
+    !connector(stub(), 12.3, 0, 5, 0, 0, 2, GEO))
+  const nearRelease = stub()
+  connector(nearRelease, 0, 0, 4, 13.999, 0, 4, GEO)
+  const points = nearRelease.ops.filter(o => o.op === "moveTo" || o.op === "bezier")
+  check("the neck closes before release", points.every(p => Math.abs(p.y) < 0.00001))
+  check("a closing neck never folds across itself", membranes(nearRelease.ops).every(p =>
+    p.y < 0 ? p.c1y <= 0 && p.c2y <= 0 : p.c1y >= 0 && p.c2y >= 0))
+  check("reach zero also disables overlapping connectors",
+    !connector(stub(), 0, 0, 5, 6, 0, 5, { ...GEO, reach: 0 }))
+}
+
+// Curve work should grow with a solid region's perimeter, not its area.
+{
+  const ctx = stub()
+  const cells = lattice(20, 20, Array(400).fill(1), Array(400).fill(1))
+  paintInk(ctx, cells, GEO, PALETTE, 0)
+  const arcs = ctx.ops.filter(o => o.op === "arc").length
+  check("solid interiors omit invisible circles", arcs === 76, `${arcs} circles for 400 cells`)
+  check("solid interiors omit invisible membranes", membranes(ctx.ops).length <= 152,
+    `${membranes(ctx.ops).length} curves for 400 cells`)
+  cells.fill[210] = 0
+  const hole = stub()
+  paintInk(hole, cells, GEO, PALETTE, 0)
+  check("opening a hole restores its boundary geometry",
+    hole.ops.filter(o => o.op === "arc").length > arcs)
+  const thin = stub()
+  paintInk(thin, lattice(2, 2, [1, 1, 1, 1], [0.6, 0.6, 0.6, 0.6]), GEO, PALETTE, 0)
+  check("thin membranes do not flood a square's centre",
+    thin.ops.filter(o => o.op === "lineTo").length === 4)
+}
+
 console.log(failures === 0 ? "\nall ink geometry checks passed" : `\n${failures} FAILED`)
 process.exit(failures === 0 ? 0 : 1)

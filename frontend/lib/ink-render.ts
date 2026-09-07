@@ -36,7 +36,6 @@
 // same way round - see `connector` for why it is traversed the way it is.
 
 const TAU = Math.PI * 2
-const HALF_PI = Math.PI / 2
 
 export interface InkGeometry {
   // radius of a cell holding the least ink that still counts as wet
@@ -52,8 +51,8 @@ export interface InkGeometry {
   // handle length factor. Sato's `handle_len_rate`, 2.4 upstream. this is the
   // dial for how taut or how slack the membrane looks
   handleSize: number
-  // how far apart two circles can be and still hold a membrane, as a multiple
-  // of the far radius added to the near one. Sato's `maxDist` uses 2.5
+  // Maximum separation relative to the mean radius. Symmetric so reversing
+  // a pair cannot change whether it joins. Sato's default is 2.5.
   reach: number
   // cells of the dry shade are struck at this radius and never fuse
   dryRadius: number
@@ -123,10 +122,15 @@ function connector(
   const d = Math.sqrt(dx * dx + dy * dy)
   // too far to hold a membrane at all, or one circle already contains the
   // other and there is nothing between them to draw
-  if (d > r1 + r2 * geo.reach) return false
+  const limit = (r1 + r2) * (1 + geo.reach) * 0.5
+  if (geo.reach <= 0 || d >= limit) return false
   if (d <= Math.abs(r1 - r2)) return false
 
-  const v = geo.spread
+  // Let the neck close continuously before releasing it. The old hard
+  // distance cutoff removed a finite-width bridge in a single frame.
+  const total = r1 + r2
+  const tension = Math.min(1, Math.max(0, (limit - d) / Math.max(0.001, limit - total)))
+  const v = geo.spread * tension * tension * (3 - 2 * tension)
   let u1 = 0
   let u2 = 0
   if (d < r1 + r2) {
@@ -136,41 +140,55 @@ function connector(
     u2 = Math.acos((r2 * r2 + d * d - r1 * r1) / (2 * r2 * d))
   }
 
-  const between = Math.atan2(dy, dx)
   // the angle to the external tangent point: the widest the membrane can be
   const maxSpread = Math.acos((r1 - r2) / d)
-  const a1 = between + u1 + (maxSpread - u1) * v
-  const a2 = between - u1 - (maxSpread - u1) * v
-  const a3 = between + Math.PI - u2 - (Math.PI - u2 - maxSpread) * v
-  const a4 = between - Math.PI + u2 + (Math.PI - u2 - maxSpread) * v
-
-  const p1x = x1 + Math.cos(a1) * r1
-  const p1y = y1 + Math.sin(a1) * r1
-  const p2x = x1 + Math.cos(a2) * r1
-  const p2y = y1 + Math.sin(a2) * r1
-  const p3x = x2 + Math.cos(a3) * r2
-  const p3y = y2 + Math.sin(a3) * r2
-  const p4x = x2 + Math.cos(a4) * r2
-  const p4y = y2 + Math.sin(a4) * r2
+  const a = u1 + (maxSpread - u1) * v
+  const b = Math.PI - u2 - (Math.PI - u2 - maxSpread) * v
+  const ux = dx / d
+  const uy = dy / d
+  const ca = Math.cos(a)
+  const sa = Math.sin(a)
+  const cb = Math.cos(b)
+  const sb = Math.sin(b)
+  // Work in the pair's local basis: four trig calls instead of sixteen,
+  // with tangent handles obtained by rotating each radius a quarter turn.
+  const n1x = ux * ca - uy * sa
+  const n1y = uy * ca + ux * sa
+  const n2x = ux * ca + uy * sa
+  const n2y = uy * ca - ux * sa
+  const n3x = ux * cb - uy * sb
+  const n3y = uy * cb + ux * sb
+  const n4x = ux * cb + uy * sb
+  const n4y = uy * cb - ux * sb
+  const p1x = x1 + n1x * r1
+  const p1y = y1 + n1y * r1
+  const p2x = x1 + n2x * r1
+  const p2y = y1 + n2y * r1
+  const p3x = x2 + n3x * r2
+  const p3y = y2 + n3y * r2
+  const p4x = x2 + n4x * r2
+  const p4y = y2 + n4y * r2
 
   // handle length, shortening as the circles separate and again as they overlap
-  const total = r1 + r2
   const chord = Math.sqrt((p3x - p1x) * (p3x - p1x) + (p3y - p1y) * (p3y - p1y))
-  const d2 = Math.min(v * geo.handleSize, chord / total) * Math.min(1, (d * 2) / total)
+  // Keep both handles on their own side of the axis as the spread closes.
+  // Without this bound a thin releasing neck can fold through itself.
+  const neckLimit = Math.min(ca > 0 ? sa / ca : Infinity, cb < 0 ? -sb / cb : Infinity) * 0.98
+  const d2 = Math.min(v * geo.handleSize, chord / total, neckLimit) * Math.min(1, (d * 2) / total)
   const h1len = r1 * d2
   const h2len = r2 * d2
 
   // a quarter turn off each point's own radius is that circle's tangent there.
   // this is the line the membrane has to leave along, and the reason the join
   // reads as liquid rather than as a shape glued on.
-  const h1x = p1x + Math.cos(a1 - HALF_PI) * h1len
-  const h1y = p1y + Math.sin(a1 - HALF_PI) * h1len
-  const h2x = p2x + Math.cos(a2 + HALF_PI) * h1len
-  const h2y = p2y + Math.sin(a2 + HALF_PI) * h1len
-  const h3x = p3x + Math.cos(a3 + HALF_PI) * h2len
-  const h3y = p3y + Math.sin(a3 + HALF_PI) * h2len
-  const h4x = p4x + Math.cos(a4 - HALF_PI) * h2len
-  const h4y = p4y + Math.sin(a4 - HALF_PI) * h2len
+  const h1x = p1x + n1y * h1len
+  const h1y = p1y - n1x * h1len
+  const h2x = p2x - n2y * h1len
+  const h2y = p2y + n2x * h1len
+  const h3x = p3x - n3y * h2len
+  const h3y = p3y + n3x * h2len
+  const h4x = p4x + n4y * h2len
+  const h4y = p4y - n4x * h2len
 
   ctx.moveTo(p2x, p2y)
   ctx.bezierCurveTo(h2x, h2y, h4x, h4y, p4x, p4y)
@@ -181,8 +199,30 @@ function connector(
 }
 
 // can two circles this far apart hold a membrane at all
-function reaches(r1: number, r2: number, d: number, reach: number): boolean {
-  return r1 > 0 && r2 > 0 && d <= r1 + r2 * reach && d > Math.abs(r1 - r2)
+interface InkScratch {
+  radius: Float32Array
+  bonded: Uint8Array
+  square: Uint8Array
+  up: Int32Array
+}
+
+const scratchByCells = new WeakMap<InkCells, InkScratch>()
+
+function scratchFor(cells: InkCells): InkScratch {
+  let scratch = scratchByCells.get(cells)
+  if (!scratch || scratch.radius.length !== cells.count) {
+    scratch = {
+      radius: new Float32Array(cells.count),
+      bonded: new Uint8Array(cells.count),
+      square: new Uint8Array(cells.count),
+      up: new Int32Array(cells.count).fill(-1),
+    }
+    for (let i = 0; i < cells.count; i++) {
+      if (cells.down[i] >= 0) scratch.up[cells.down[i]] = i
+    }
+    scratchByCells.set(cells, scratch)
+  }
+  return scratch
 }
 
 // paint every shade of a lattice. `dryShade` is drawn as plain small circles
@@ -196,99 +236,94 @@ export function paintInk(
   dryShade = -1,
 ) {
   const { count, x, y, fill, shade, right, left, down, downRight, downLeft } = cells
+  const { radius, bonded, square, up } = scratchFor(cells)
   const span = geo.maxRadius - geo.minRadius
   const swell = geo.swellIn ?? 0
-  const radiusOf = (i: number) => {
-    const r = geo.minRadius + span * fill[i]
-    if (swell <= 0 || fill[i] >= swell) return r
-    // eased, not linear, so the growth arrives without a corner at either end
-    const t = fill[i] / swell
-    return r * t * t * (3 - 2 * t)
+  square.fill(0)
+
+  // One radius calculation per cell, shared by every neighbour and shade.
+  for (let i = 0; i < count; i++) {
+    const f = Math.max(0, Math.min(1, fill[i]))
+    const t = swell > 0 ? Math.min(1, f / swell) : 1
+    radius[i] = shade[i] === dryShade ? geo.dryRadius :
+      (geo.minRadius + span * f) * t * t * (3 - 2 * t)
+    bonded[i] = f > 0 && f >= swell && shade[i] !== dryShade ? 1 : 0
   }
-  const gap = (a: number, b: number) => Math.hypot(x[b] - x[a], y[b] - y[a])
+
+  // A square entirely inside overlapping dots is solid. Its internal circles
+  // and connectors cannot affect the silhouette, so rasterise it as a strip.
+  // Require actual overlap, not just a tenuous neck: otherwise filling the
+  // centre turns four separated beads into a rectangle in a single frame.
+  if (geo.reach > 0) {
+    for (let i = 0; i < count; i++) {
+      const r = right[i], d = down[i], dr = downRight[i]
+      if (!bonded[i] || r < 0 || d < 0 || dr < 0 ||
+          !bonded[r] || !bonded[d] || !bonded[dr] ||
+          shade[r] !== shade[i] || shade[d] !== shade[i] || shade[dr] !== shade[i]) continue
+      const dx = x[r] - x[i], dy = y[d] - y[i]
+      // Only axis-aligned lattice squares. Subpixel-moving face details use
+      // the ordinary path geometry and never get flattened into a strip.
+      if (dx <= 0 || dy <= 0 || y[r] !== y[i] || x[d] !== x[i] ||
+          x[dr] !== x[r] || y[dr] !== y[d]) continue
+      const min = Math.min(radius[i], radius[r], radius[d], radius[dr])
+      const max = Math.max(radius[i], radius[r], radius[d], radius[dr])
+      if (min * 2 >= Math.max(dx, dy) && max <= Math.min(dx, dy)) square[i] = 1
+    }
+  }
 
   for (let s = 0; s < palette.length; s++) {
     let opened = false
     const dry = s === dryShade
-    const wet = (i: number) => i >= 0 && shade[i] === s && fill[i] > 0
-    // a membrane needs a dot on both ends. a cell still swelling in has next
-    // to no radius, and a membrane attached to it converges to a point - a
-    // hair sticking out of the mass rather than a neck within it. so while a
-    // cell is arriving or leaving it is only a bead, and it bonds once it
-    // holds real ink.
-    const bonded = (i: number) => wet(i) && fill[i] >= swell
+    const same = (i: number) => i >= 0 && shade[i] === s && bonded[i] !== 0
 
     for (let i = 0; i < count; i++) {
-      if (shade[i] !== s || fill[i] <= 0) continue
+      if (shade[i] !== s || fill[i] <= 0 || radius[i] <= 0) continue
       if (!opened) {
         ctx.beginPath()
         opened = true
       }
 
-      const r = dry ? geo.dryRadius : radiusOf(i)
-      ctx.moveTo(x[i] + r, y[i])
-      ctx.arc(x[i], y[i], r, 0, TAU)
-      if (dry) continue
+      const r = radius[i]
+      const l = left[i], u = up[i]
+      const ul = u >= 0 ? left[u] : -1
+      const covered = square[i] && l >= 0 && square[l] &&
+        u >= 0 && square[u] && ul >= 0 && square[ul]
+      if (!covered) {
+        ctx.moveTo(x[i] + r, y[i])
+        ctx.arc(x[i], y[i], r, 0, TAU)
+      }
+      if (dry || geo.reach <= 0) continue
 
-      // the four forward neighbours. walking forward only means each pair is
-      // visited exactly once, so no membrane is ever drawn twice.
-      if (bonded(i)) {
-        for (let dir = 0; dir < 4; dir++) {
-          const j =
-            dir === 0 ? right[i] : dir === 1 ? down[i] : dir === 2 ? downRight[i] : downLeft[i]
-          if (!bonded(j)) continue
-
-          if (dir >= 2) {
-            if (!geo.diagonals) continue
-            // a diagonal membrane only where the L-shaped route is not already
-            // ink. drawn regardless, it would pack the corners of a solid block
-            // and the body would read as tiled rather than poured.
-            if (bonded(dir === 2 ? right[i] : left[i])) continue
-            if (bonded(down[i])) continue
-          }
-
-          connector(ctx, x[i], y[i], r, x[j], y[j], radiusOf(j), geo)
+      if (bonded[i]) {
+        for (let dir = 0; dir < (geo.diagonals ? 4 : 2); dir++) {
+          const j = dir === 0 ? right[i] : dir === 1 ? down[i] :
+            dir === 2 ? downRight[i] : downLeft[i]
+          if (!same(j)) continue
+          if (dir === 0 && square[i] && u >= 0 && square[u]) continue
+          if (dir === 1 && square[i] && l >= 0 && square[l]) continue
+          if (dir >= 2 && (same(dir === 2 ? right[i] : l) || same(down[i]))) continue
+          connector(ctx, x[i], y[i], r, x[j], y[j], radius[j], geo)
         }
       }
 
-      // four circles meeting at the corners of one lattice square cover its
-      // edges - the membranes see to that - but not its middle, and the pinhole
-      // left behind reads as a perforation rather than as poured ink. the square
-      // joining the four centres plugs it exactly: its corners are the centres,
-      // which are deep inside their own circles, and its edges lie along the
-      // centre-to-centre axes, which every membrane straddles. so it can only
-      // ever add area that is already inside the union, and never changes the
-      // silhouette.
-      //
-      // only for a square that is wet on all four corners and joined all the
-      // way round. one corner too faint to hold a membrane means the square has
-      // an open side, and plugging it then WOULD show.
-      const rr = right[i]
-      const dd = down[i]
-      const dr = downRight[i]
-      if (bonded(i) && bonded(rr) && bonded(dd) && bonded(dr)) {
-        const rRight = radiusOf(rr)
-        const rDown = radiusOf(dd)
-        const rDiag = radiusOf(dr)
-        if (
-          reaches(r, rRight, gap(i, rr), geo.reach) &&
-          reaches(r, rDown, gap(i, dd), geo.reach) &&
-          reaches(rRight, rDiag, gap(rr, dr), geo.reach) &&
-          reaches(rDown, rDiag, gap(dd, dr), geo.reach)
-        ) {
-          // wound the same way as `arc` sweeps, like every other subpath here
-          ctx.moveTo(x[i], y[i])
-          ctx.lineTo(x[rr], y[rr])
-          ctx.lineTo(x[dr], y[dr])
-          ctx.lineTo(x[dd], y[dd])
-          ctx.closePath()
-        }
+      // Adjacent full squares share one rectangle, with the same winding as
+      // the circles. No overlapping interior paths for Canvas to tessellate.
+      if (square[i] && (l < 0 || !square[l])) {
+        let end = i
+        while (right[end] >= 0 && square[right[end]]) end = right[end]
+        const rr = right[end], dd = down[i]
+        ctx.moveTo(x[i], y[i])
+        ctx.lineTo(x[rr], y[i])
+        ctx.lineTo(x[rr], y[dd])
+        ctx.lineTo(x[i], y[dd])
+        ctx.closePath()
       }
     }
 
-    if (!opened) continue
-    ctx.fillStyle = palette[s]
-    ctx.fill()
+    if (opened) {
+      ctx.fillStyle = palette[s]
+      ctx.fill()
+    }
   }
 }
 

@@ -313,6 +313,80 @@ const SINE_BOUND = 0.5 * w * w // ~0.00169
   check("disposed worklet emits no more reports", reports === 0, "")
 }
 
+// PCM and the next play command may reach the audio thread before its reset
+// fade finishes. The new take's first packet must survive that boundary.
+{
+  const p = make({ prebufferSeconds: 0.2, minRate: 1 })
+  const old = new Int16Array(SR * 2).fill(12000)
+  p.receive({ type: "pcm", pcm: old.buffer })
+  p.receive({ type: "play", fresh: true })
+  pull(p, 30)
+  p.receive({ type: "reset" })
+  p.receive({ type: "play", fresh: true })
+  const fresh = new Int16Array(SR).fill(-12000)
+  p.receive({ type: "pcm", pcm: fresh.buffer })
+  const [out] = pull(p, 40)
+  check("reset preserves PCM received during its fade", p.written === SR / 2 && out.at(-1) < -0.3, "")
+  check("new take follows the reset fade without a splice", worstSecondDiff(out).worst < 0.002, "")
+}
+
+// Pause must win even when a reset is still fading and new PCM is queued.
+{
+  const p = make({ prebufferSeconds: 0.2, minRate: 1 })
+  feed(p, SR, { phase: 0 })
+  check("buffered PCM stays silent until play", pull(p, 12)[0].every((v) => v === 0), "")
+  p.receive({ type: "play", fresh: true })
+  pull(p, 30)
+  p.receive({ type: "reset" })
+  p.receive({ type: "play", fresh: true })
+  p.receive({ type: "stop" })
+  feed(p, SR / 2, { phase: 0 })
+  pull(p, 15)
+  check("pause during reset keeps the new reservoir silent", pull(p, 30)[0].every((v) => v === 0), "")
+  p.receive({ type: "play", fresh: false })
+  check("paused reset retains audio for resume", pull(p, 30)[0].some((v) => Math.abs(v) > 0.1), "")
+}
+
+// A frozen tab can overflow. Dropping one chunk and accepting the next used
+// to create a full-amplitude splice after the old reservoir drained.
+{
+  const p = make({ ringSeconds: 1, prebufferSeconds: 0.2, minRate: 1 })
+  p.receive({ type: "pcm", pcm: new Int16Array(Math.floor(SR * 0.8) * 2).fill(12000).buffer })
+  p.receive({ type: "play", fresh: true })
+  pull(p, 30)
+  p.receive({ type: "pcm", pcm: new Int16Array(Math.floor(SR * 0.6) * 2).fill(-12000).buffer })
+  const [out] = pull(p, 40)
+  check("overflow recovers a bounded contiguous reservoir", p.overflows === 1 && p.written === SR * 0.6, "")
+  check("overflow fades into new audio without a splice", out.at(-1) < -0.3 && worstSecondDiff(out).worst < 0.002, "")
+}
+
+// At matching rates the transport must preserve every PCM sample exactly.
+{
+  const p = make({ prebufferSeconds: 0.2, minRate: 1 })
+  const pcm = new Int16Array(SR * 2)
+  for (let i = 0; i < pcm.length; i++) pcm[i] = (i * 7919) % 65536 - 32768
+  p.receive({ type: "pcm", pcm: pcm.buffer })
+  p.receive({ type: "play", fresh: true })
+  pull(p, 30)
+  const start = p.readPos
+  const [left, right] = pull(p, 10)
+  check(
+    "native-rate rendering preserves stereo PCM exactly",
+    left.every((v, i) => v === pcm[(start + i) * 2] / 32768) &&
+      right.every((v, i) => v === pcm[(start + i) * 2 + 1] / 32768),
+    "",
+  )
+}
+
+{
+  const p = make({ prebufferSeconds: 0.2, rebufferSeconds: 0.6, minRate: 1 })
+  feed(p, SR / 2, { phase: 0 })
+  p.receive({ type: "play", fresh: true })
+  pull(p, Math.ceil(SR / Q))
+  p.receive({ type: "config", prebufferSeconds: 0.1, rebufferSeconds: 0.6 })
+  check("throughput updates preserve the rebuffer threshold after underrun", p.need === SR * 0.6, "")
+}
+
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

@@ -196,7 +196,12 @@ class SlicedProjectorTests(unittest.TestCase):
             class Deferred:
                 inner = Inner()
 
-            projector = fast_engine._build_projector(Deferred(), Config, mx)
+            # Native nanobind functions have no inspectable signature on
+            # MLX 0.32.2. This must not silently disable the entire fast step.
+            with patch.object(
+                fast_engine.inspect, "signature", side_effect=ValueError("native callable")
+            ):
+                projector = fast_engine._build_projector(Deferred(), Config, mx)
             self.assertIsNotNone(projector)
 
             probe = mx.random.normal((1, 1, features), key=mx.random.key(3)).astype(
@@ -247,6 +252,72 @@ class SlicedProjectorTests(unittest.TestCase):
         OddLinear.compute_dtype = None
         OddLinear._param_dtype = None
         self.assertIsNone(fast_engine._build_projector(Inner(), Config, mx))
+
+
+class SynthesisWindowCacheTests(unittest.TestCase):
+    def test_window_is_computed_once_and_preserves_streaming_audio(self):
+        try:
+            import magenta_rt  # noqa: F401
+            import mlx.core as mx
+            import sequence_layers.mlx as sl
+            from sequence_layers.mlx import signal
+            from fast_engine import _cache_synthesis_windows
+        except ImportError as exc:
+            self.skipTest(f"MLX runtime unavailable: {exc}")
+        from functools import wraps
+        from types import SimpleNamespace
+
+        window_fn = signal.inverse_stft_window_fn(4)
+        calls = []
+
+        @wraps(window_fn)
+        def counted_window(*args, **kwargs):
+            calls.append(1)
+            return window_fn(*args, **kwargs)
+
+        layer = sl.InverseSTFT(
+            frame_length=16, frame_step=4, fft_length=16,
+            window_fn=counted_window,
+        )
+        rng = np.random.default_rng(8)
+        values = rng.normal(size=(1, 6, 9, 2)) + 1j * rng.normal(size=(1, 6, 9, 2))
+        inputs = sl.Sequence.from_values(mx.array(values.astype(np.complex64)))
+
+        def render():
+            state = layer.get_initial_state(1, inputs.channel_spec)
+            outputs = []
+            for index in range(inputs.shape[1]):
+                output, state = layer.step(inputs[:, index:index + 1], state)
+                outputs.append(output)
+            return np.asarray(sl.Sequence.concatenate_sequences(outputs).values)
+
+        expected = render()
+        self.assertEqual(len(calls), 6)
+        spectrostream = SimpleNamespace(named_modules=lambda: [("decoder.istft", layer)])
+        self.assertTrue(_cache_synthesis_windows(spectrostream, sl))
+        self.assertEqual(len(calls), 7)  # Prewarmed during installation.
+        actual = render()
+        np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(len(calls), 7)
+        self.assertTrue(_cache_synthesis_windows(spectrostream, sl))
+        self.assertEqual(len(calls), 7)
+
+    def test_arbitrary_window_functions_are_not_cached(self):
+        try:
+            import magenta_rt  # noqa: F401
+            import sequence_layers.mlx as sl
+            from fast_engine import _cache_synthesis_windows
+        except ImportError as exc:
+            self.skipTest(f"MLX runtime unavailable: {exc}")
+        from types import SimpleNamespace
+
+        window = lambda size: np.ones(size, dtype=np.float32)
+        layer = sl.InverseSTFT(
+            frame_length=16, frame_step=4, fft_length=16, window_fn=window
+        )
+        spectrostream = SimpleNamespace(named_modules=lambda: [("decoder.istft", layer)])
+        self.assertFalse(_cache_synthesis_windows(spectrostream, sl))
+        self.assertIs(layer._window_fn, window)
 
 
 if __name__ == "__main__":

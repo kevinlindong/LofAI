@@ -42,7 +42,7 @@ STATIONS: dict[str, Station] = {
     "dusty-beats": Station(
         "dusty-beats",
         "Dusty Beats",
-        "instrumental mellow lo-fi hip hop, dusty drums, warm jazz guitar, vinyl",
+        "instrumental mellow lo-fi hip hop, dusty drums, warm jazz guitar",
         "neutral",
         "guitar",
         76,
@@ -52,7 +52,7 @@ STATIONS: dict[str, Station] = {
     "rainy-piano": Station(
         "rainy-piano",
         "Rainy Piano",
-        "instrumental ambient lo-fi, intimate felt piano, sparse brushed drums, soft tape warmth",
+        "instrumental ambient lo-fi, intimate felt piano, sparse brushed drums",
         "somber",
         "piano",
         68,

@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -86,11 +87,10 @@ PROBE_FRAMES = 25
 # has actually caught up with the new setting, so it cannot chase itself.
 TUNE_DWELL_SECONDS = 6.0
 
-# how many recent chunks the render-speed estimate is taken over, and - the
-# important part - taken as a median rather than a mean. on a machine under
-# memory pressure a single chunk can take twice as long as its neighbours, and
-# an average lets that one chunk spend a codebook of everybody's audio. a
-# median asks the machine to actually be slow, not to have hiccupped once.
+# Recent chunks used to measure actual audio produced / total render time.
+# A median hides recurring stalls even when their cost drains the reservoir.
+# Only quality reductions may exclude one worst chunk, so an isolated hiccup
+# need not spend fidelity; repeated stalls still count against the budget.
 COST_WINDOW = 9
 MIN_TUNE_SAMPLES = 5
 
@@ -233,12 +233,13 @@ class MRTEngine:
         self._depth_config = None
         self._keepalive_value = None
 
-        # recent render cost in seconds per frame, for the auto-tuner
-        self._costs: deque[float] = deque(maxlen=COST_WINDOW)
+        # (model frames, elapsed seconds), weighted by actual audio duration
+        self._costs: deque[tuple[int, float]] = deque(maxlen=COST_WINDOW)
         self._last_known_cost = 0.0
         self._cost_lock = threading.Lock()
         self._active_streams = 1
         self._last_tune = 0.0
+        self._deficit_since: float | None = None
         cache_root = os.environ.get(
             "MRT_EMBEDDING_CACHE",
             str(Path.home() / "Library" / "Caches" / "lofai" / "embeddings"),
@@ -259,9 +260,10 @@ class MRTEngine:
             return 0.0
         return FRAME_SECONDS / cost
 
-    def effective_realtime_factor(self) -> float:
+    def effective_realtime_factor(self, *, ignore_worst: bool = False) -> float:
         """Measured render headroom available to each concurrent listener."""
-        factor = self.realtime_factor()
+        cost = self._typical_cost(ignore_worst=ignore_worst)
+        factor = FRAME_SECONDS / cost if cost > 0.0 else 0.0
         with self._cost_lock:
             active_streams = self._active_streams
         return factor / max(1, active_streams)
@@ -271,14 +273,16 @@ class MRTEngine:
         with self._cost_lock:
             return len(self._costs) >= MIN_TUNE_SAMPLES
 
-    def _typical_cost(self) -> float:
+    def _typical_cost(self, *, ignore_worst: bool = False) -> float:
         with self._cost_lock:
             costs = tuple(self._costs)
             fallback = self._last_known_cost
         if not costs:
             return fallback
-        ordered = sorted(costs)
-        return ordered[len(ordered) // 2]
+        if ignore_worst and len(costs) >= MIN_TUNE_SAMPLES:
+            worst = max(range(len(costs)), key=lambda i: costs[i][1] / costs[i][0])
+            costs = costs[:worst] + costs[worst + 1:]
+        return sum(seconds for _, seconds in costs) / sum(frames for frames, _ in costs)
 
     def _seed_cost(self, cost: float):
         # start the window off at what calibration just measured, so the first
@@ -286,15 +290,18 @@ class MRTEngine:
         with self._cost_lock:
             self._costs.clear()
             for _ in range(COST_WINDOW):
-                self._costs.append(cost)
+                self._costs.append((PROBE_FRAMES, cost * PROBE_FRAMES))
             self._last_known_cost = cost
+        self._deficit_since = None
 
     def _clear_costs(self):
         with self._cost_lock:
             if self._costs:
-                ordered = sorted(self._costs)
-                self._last_known_cost = ordered[len(ordered) // 2]
+                self._last_known_cost = sum(s for _, s in self._costs) / sum(
+                    f for f, _ in self._costs
+                )
             self._costs.clear()
+        self._deficit_since = None
 
     def prepare_start(self):
         self._stop_requested.clear()
@@ -834,15 +841,18 @@ class MRTEngine:
         )
 
     def note_render(self, frames: int, seconds: float, active_streams: int = 1):
-        # feed the tuner. see COST_WINDOW for why this is a median and not an
-        # average: we do not want the quality flapping every time something
-        # else on the machine has a moment.
-        if frames <= 0 or seconds <= 0.0:
+        # Count every completed render in the throughput displayed to clients.
+        if frames <= 0 or seconds <= 0.0 or not math.isfinite(seconds):
             return
         with self._cost_lock:
             self._active_streams = max(1, int(active_streams))
-            self._costs.append(seconds / frames)
+            self._costs.append((frames, seconds))
         self._retune(time.monotonic())
+
+    def note_idle(self):
+        # Paused time is not evidence of a sustained rendering deficit.
+        # Called by the owning worker when no listener is consuming audio.
+        self._deficit_since = None
 
     def note_gap(self):
         # a listener's reservoir actually ran dry. that is the one measurement
@@ -873,8 +883,12 @@ class MRTEngine:
         # also report low water; lowering model quality cannot fix those. Do
         # not spend fidelity while measured rendering still clears its target.
         # Audible gaps remain the unconditional signal in note_gap().
-        factor = self.effective_realtime_factor()
-        if sample_count < MIN_TUNE_SAMPLES or factor >= self.target_rtf:
+        factor = self.effective_realtime_factor(ignore_worst=True)
+        sustained = (
+            self._deficit_since is not None
+            and now - self._deficit_since >= TUNE_DWELL_SECONDS
+        )
+        if sample_count < MIN_TUNE_SAMPLES or (factor >= self.target_rtf and not sustained):
             return
         if self.set_codebooks(self.codebooks - 1):
             self._clear_costs()
@@ -888,15 +902,33 @@ class MRTEngine:
     def _retune(self, now: float):
         if self.pinned_codebooks or self._depth_config is None:
             return
-        if now - self._last_tune < TUNE_DWELL_SECONDS:
-            return
         with self._cost_lock:
             sample_count = len(self._costs)
         if sample_count < MIN_TUNE_SAMPLES:
             return
 
         factor = self.effective_realtime_factor()
-        if factor < self.target_rtf and self.codebooks > self.min_codebooks:
+        if factor < self.target_rtf:
+            if self._deficit_since is None:
+                self._deficit_since = now
+        else:
+            self._deficit_since = None
+        if now - self._last_tune < TUNE_DWELL_SECONDS:
+            return
+        # Even one stall per window is recurring if the actual deficit never
+        # recovers. Do not let the isolated-jitter allowance hide that forever.
+        sustained = (
+            self._deficit_since is not None
+            and now - self._deficit_since >= TUNE_DWELL_SECONDS
+        )
+        if (
+            factor < self.target_rtf
+            and (
+                self.effective_realtime_factor(ignore_worst=True) < self.target_rtf
+                or sustained
+            )
+            and self.codebooks > self.min_codebooks
+        ):
             changed = self.set_codebooks(self.codebooks - 1)
         elif factor > self.target_rtf * 1.3 and self.codebooks < self.max_codebooks:
             # only give detail back when there is real headroom, so the two

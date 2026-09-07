@@ -37,10 +37,10 @@ def _music_second(rng, gap_floor_dbfs: float, gap_hiss: bool, level_db=-20.0):
     return np.concatenate([music, gap]).astype(np.float64)
 
 
-def _feed_seconds(monitor, seconds_audio: np.ndarray):
+def _feed_seconds(monitor, seconds_audio: np.ndarray, *, chunk_frames=CHUNK_FRAMES_48K):
     pcm = _stereo_int16(seconds_audio)
     frame_bytes = 4
-    chunk = CHUNK_FRAMES_48K * frame_bytes
+    chunk = chunk_frames * frame_bytes
     for start in range(0, len(pcm), chunk):
         monitor.observe(pcm[start : start + chunk])
 
@@ -86,8 +86,7 @@ class TakeFloorMonitorTests(unittest.TestCase):
         )
 
     def test_low_frequency_floor_rise_alone_is_not_hiss(self):
-        # Both the floor AND its high band must rise: a warm low rumble or a
-        # denser bass texture is musical, not a hiss bed.
+        # A warm low rumble without a high-band rise is not a hiss bed.
         rng = np.random.default_rng(7)
         monitor = TakeFloorMonitor()
         clean = np.concatenate(
@@ -119,6 +118,78 @@ class TakeFloorMonitorTests(unittest.TestCase):
         monitor.observe(b"pcm")
         monitor.observe(b"\x00" * 7)
         self.assertFalse(monitor.drifted)
+
+    def test_opposite_phase_stereo_hiss_is_still_detected(self):
+        rng = np.random.default_rng(11)
+        monitor = TakeFloorMonitor()
+        for second in range(230):
+            audio = _music_second(
+                rng, -50.0 if second < 140 else -28.0, gap_hiss=True
+            )
+            stereo = np.frombuffer(_stereo_int16(audio), dtype="<i2").copy()
+            stereo = stereo.reshape(-1, 2)
+            # Keep the performance centered; put just its noise bed in the
+            # stereo side channel. It is audible but cancels in a mono fold.
+            stereo[int(0.8 * RATE) :, 1] *= -1
+            monitor.observe(stereo.tobytes())
+            if second == 139:
+                self.assertFalse(monitor.drifted)
+        self.assertTrue(monitor.drifted)
+
+    def test_sustain_measures_audio_time_independent_of_chunk_size(self):
+        rng = np.random.default_rng(11)
+        short_chunks = TakeFloorMonitor()
+        long_chunks = TakeFloorMonitor()
+        for second in range(230):
+            audio = _music_second(
+                rng, -50.0 if second < 140 else -28.0, gap_hiss=True
+            )
+            _feed_seconds(short_chunks, audio, chunk_frames=int(0.04 * RATE))
+            _feed_seconds(long_chunks, audio, chunk_frames=int(0.8 * RATE))
+            self.assertEqual(short_chunks.drifted, long_chunks.drifted)
+        self.assertTrue(short_chunks.drifted, "sustained hiss must be detected")
+        self.assertEqual(
+            list(short_chunks._drift_votes), list(long_chunks._drift_votes)
+        )
+
+    def test_empty_chunks_do_not_turn_a_brief_rise_into_sustained_drift(self):
+        rng = np.random.default_rng(11)
+        monitor = TakeFloorMonitor()
+        for second in range(200):
+            _feed_seconds(
+                monitor,
+                _music_second(rng, -50.0 if second < 140 else -28.0, gap_hiss=True),
+            )
+        self.assertTrue(any(monitor._drift_votes), "the current floor has risen")
+        self.assertFalse(monitor.drifted, "the rise has not lasted long enough")
+        before = list(monitor._drift_votes)
+        for _ in range(200):
+            monitor.observe(b"")
+            monitor.observe(b"pcm")
+        self.assertEqual(list(monitor._drift_votes), before)
+        self.assertFalse(monitor.drifted)
+
+    def test_sustained_brightening_is_detected_without_overall_floor_rise(self):
+        rng = np.random.default_rng(17)
+        monitor = TakeFloorMonitor()
+        gap_t = np.arange(int(0.2 * RATE)) / RATE
+        for second in range(230):
+            audio = _music_second(rng, -30.0, gap_hiss=False)
+            hiss_db = -60.0 if second < 140 else -36.0
+            audio[-gap_t.size :] += rng.normal(
+                0.0, 10 ** (hiss_db / 20), gap_t.size
+            )
+            _feed_seconds(monitor, audio)
+        self.assertTrue(monitor.drifted)
+        current_floor, _ = take_health._floor_profile(
+            monitor._trailing_rms, monitor._trailing_high
+        )
+        self.assertLess(
+            take_health._dbfs(current_floor)
+            - take_health._dbfs(monitor._baseline_floor),
+            3.0,
+            "spectral drift must not need a large overall volume increase",
+        )
 
     def test_reset_forgets_the_baseline(self):
         monitor = self._run_take(drift=True)
