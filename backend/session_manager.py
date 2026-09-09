@@ -76,6 +76,12 @@ class SessionManager:
 
     def __init__(self):
         self.engine = engine_mod.MRTEngine()
+        # The engine pre-traces its compiled graphs for exactly the chunk
+        # lengths this worker renders.
+        self.engine.live_frame_counts = (
+            min(CHUNK_FRAMES, FIRST_CHUNK_FRAMES),
+            CHUNK_FRAMES,
+        )
         self._sessions: dict[str, Session] = {}
         self._active: list[Session] = []
         self._waiting: deque[Session] = deque()
@@ -580,6 +586,19 @@ class SessionManager:
                     self.engine._fast_engine.summary()
                     if getattr(self.engine, "_fast_engine", None) is not None
                     else None
+                ),
+                "renderer": (
+                    self.engine._renderer.status.summary()
+                    if getattr(self.engine, "_renderer", None) is not None
+                    else None
+                ),
+                "styleTokenizer": (
+                    "native"
+                    if getattr(self.engine, "_tokenizer", None) is not None
+                    else "tflite"
+                ),
+                "releasedStyleInterpreters": list(
+                    getattr(self.engine, "_released_interpreters", ())
                 ),
                 "codebooks": self.engine.codebooks,
                 "minCodebooks": self.engine.min_codebooks,

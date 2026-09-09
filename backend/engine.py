@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from audio_quality import require_startup_pcm_quality
+from compiled_engine import flatten as flatten_state
 from melody import piano_roll
 
 log = logging.getLogger(__name__)
@@ -194,6 +195,25 @@ class MRTEngine:
         self.mlx_cache_mb = _env_int("MRT_MLX_CACHE_MB", 384)
         self.fast_sampler_enabled = _env_int("MRT_FAST_SAMPLER", 1) != 0
         self.fast_engine_enabled = _env_int("MRT_FAST_ENGINE", 1) != 0
+        # Trace the depthformer step and the codec with mx.compile. Removes
+        # most Python graph-building from the model thread and fuses the depth
+        # loop's small kernels; output differs from eager only by bf16
+        # rounding (see compiled_engine).
+        self.compile_enabled = _env_int("MRT_COMPILE", 1) != 0
+        # Decode a chunk's tokens in one codec call instead of one per frame.
+        # Exactly the same samples; roughly a third of the codec time.
+        self.batch_codec_enabled = _env_int("MRT_BATCH_CODEC", 1) != 0
+        # Replace MusicCoCa's TFLite RVQ with a verified NumPy replica and drop
+        # the resident TFLite interpreters once the station prompts are warm.
+        self.native_tokenizer_enabled = _env_int("MRT_NATIVE_STYLE_TOKENIZER", 1) != 0
+        self.release_style_model_enabled = _env_int("MRT_RELEASE_STYLE_MODEL", 1) != 0
+        # Chunk lengths the live path renders, so compiled graphs for them
+        # can be traced before the first listener. SessionManager overrides
+        # this with its configured chunk sizes.
+        self.live_frame_counts: tuple[int, ...] = (
+            max(1, _env_int("MRT_FIRST_CHUNK_FRAMES", 8)),
+            max(1, _env_int("MRT_CHUNK_FRAMES", 10)),
+        )
 
         # 0 keeps the live auto-tuner; any other value pins the codebook count.
         # Evaluation and offline renders explicitly pin all 12, while the live
@@ -228,6 +248,9 @@ class MRTEngine:
         self._fast = False
         self._fast_sampling = False
         self._fast_engine = None
+        self._renderer = None
+        self._tokenizer = None
+        self._released_interpreters: list[str] = []
         self._sampler = None
         self._input_spec = None
         self._depth_config = None
@@ -331,6 +354,12 @@ class MRTEngine:
             self._notes_key = PIANOROLL_WITH_ONSETS.key
             self._drums_key = DRUM_PIANOROLL.key
             started = time.monotonic()
+            # Bound MLX's reusable-buffer cache from the first allocation. The
+            # weight load and quantization otherwise leave more than a
+            # gigabyte of freed buffers cached, and on an 8 GB machine that
+            # transient is swap pressure. Loading was not slower under the
+            # limit in local measurement.
+            self._limit_mlx_cache()
 
             if self.backend == "mlxfn":
                 log.warning(
@@ -463,6 +492,17 @@ class MRTEngine:
                 self._depth_config = config
                 self.max_codebooks = int(config.num_codebooks)
                 self.codebooks = self.max_codebooks
+            from compiled_engine import ChunkRenderer
+
+            self._renderer = ChunkRenderer(
+                system._sampler,
+                config,
+                mx,
+                sl,
+                compile_enabled=self.compile_enabled,
+                batch_codec=self.batch_codec_enabled,
+            )
+            log.info("chunk renderer: %s", self._renderer.status.summary())
             self._fast = True
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -531,14 +571,70 @@ class MRTEngine:
             self._raise_if_stopping()
             self.embed(prompt, reference)
 
+        # Tokenizing is a plain residual VQ; run it natively so the live path
+        # never touches a TFLite interpreter. Verified against TFLite first.
+        self._install_native_tokenizer()
+
         # MusicCoCa builds its RVQ interpreter lazily. Build and cache every
-        # fixed conditioning block now so no listener pays that startup cost.
+        # fixed conditioning block now - with and without drums - so no
+        # listener pays that startup cost.
         if prompts and self._fast:
             for prompt in prompts:
                 self._raise_if_stopping()
                 reference = references.get(prompt)
                 key = self.style_cache_key(prompt, reference)
-                self._conditioning(self.embed(prompt, reference), key)
+                style = self.embed(prompt, reference)
+                self._conditioning(style, key)
+                self._conditioning(style, key, drum=0)
+
+        self._release_style_model()
+
+    def _install_native_tokenizer(self):
+        if not self.native_tokenizer_enabled or self._tokenizer is not None:
+            return
+        try:
+            import style_tokens
+
+            self._tokenizer = style_tokens.load_or_extract(
+                self._system._style_model,
+                self._embedding_cache_dir,
+                list(self._embeddings.values()),
+            )
+        except Exception as exc:  # noqa: BLE001 - optional specialization
+            log.warning("native style tokenizer unavailable: %s", exc)
+            self._tokenizer = None
+
+    def _release_style_model(self):
+        """Free MusicCoCa's TFLite interpreters once startup no longer needs them.
+
+        The text encoder alone holds hundreds of megabytes resident. Prompts
+        are embedded and cached, so the live path only ever tokenizes - and
+        with the native tokenizer installed, not even that. Any later request
+        for an unknown prompt rebuilds the interpreter it needs transparently.
+        """
+        if not self.release_style_model_enabled:
+            return
+        try:
+            import style_tokens
+
+            released = style_tokens.release_interpreters(
+                self._system._style_model,
+                include_quantizer=self._tokenizer is not None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not release the style model: %s", exc)
+            return
+        if released:
+            self._released_interpreters = released
+            log.info(
+                "released MusicCoCa TFLite interpreters: %s", ", ".join(released)
+            )
+
+    def tokenize_style(self, style: np.ndarray) -> list[int]:
+        """Return the 12 MusicCoCa RVQ tokens for a 768-d style embedding."""
+        if self._tokenizer is not None:
+            return [int(token) for token in self._tokenizer.tokenize(style)]
+        return [int(token) for token in self._system._style_model.tokenize(style)]
 
     @staticmethod
     def style_cache_key(prompt: str, reference: str | None = None) -> str:
@@ -663,7 +759,7 @@ class MRTEngine:
             else None
         )
         if fixed_tokens is None:
-            tokens = list(self._system._style_model.tokenize(style))
+            tokens = self.tokenize_style(style)
             tokens[self.style_token_levels :] = [-1] * (
                 len(tokens) - self.style_token_levels
             )
@@ -719,10 +815,67 @@ class MRTEngine:
         # this is the last thing that happens before the engine reports itself
         # ready, so nobody is promoted into a stream mid-measurement.
         self._raise_if_stopping()
+        # Trace first, measure second: a compiled graph's first call at a new
+        # codebook count or chunk length includes its trace, and a probe that
+        # swallowed one would read as a machine far slower than it is and
+        # walk the quality dial to the floor for nothing.
+        self._prewarm()
+        self._raise_if_stopping()
         self._calibrate()
         self._raise_if_stopping()
         self._trim_mlx_cache()
         self._warm = True
+
+    def _prewarm(self):
+        # Trace every compiled graph the live path can reach - each reachable
+        # codebook count at each live chunk length and the calibration probe
+        # length, from a fresh state so the first-frame signature is covered
+        # too - before anything is timed or anyone is listening.
+        renderer = self._renderer
+        if not self._fast or renderer is None or not renderer.compiled:
+            return
+        if not self._embeddings:
+            return
+        if self.pinned_codebooks or self._depth_config is None:
+            if self.pinned_codebooks and self._depth_config is not None:
+                # Calibration pins this count next; trace it, not the default.
+                self.set_codebooks(self.pinned_codebooks)
+            counts = [self.codebooks]
+        else:
+            counts = list(range(self.min_codebooks, self.max_codebooks + 1))
+        (prompt, reference), style = next(iter(self._embeddings.items()))
+        key = self.style_cache_key(prompt, reference)
+        chosen = self.codebooks
+        frame_counts = (*self.live_frame_counts, PROBE_FRAMES)
+
+        def render(frames: int):
+            self._raise_if_stopping()
+            self.generate(None, (ConditioningRun(style, key, None, frames),), seed=0)
+
+        elapsed = renderer.prewarm(render, counts, frame_counts, self.set_codebooks)
+        self.set_codebooks(chosen)
+        log.info(
+            "prewarmed compiled graphs (%s codebooks x %s frames) in %.1fs: %s",
+            "/".join(str(count) for count in counts),
+            "/".join(str(frames) for frames in sorted(set(frame_counts))),
+            elapsed,
+            renderer.status.summary(),
+        )
+
+    def _mlx_module(self):
+        try:
+            return self._mx if self._fast else __import__("mlx.core", fromlist=["core"])
+        except (ImportError, AttributeError):
+            return None
+
+    def _limit_mlx_cache(self):
+        if self.mlx_cache_mb <= 0:
+            return
+        mx = self._mlx_module()
+        if mx is None:
+            return
+        mx.set_cache_limit(self.mlx_cache_mb * 1024 * 1024)
+        mx.clear_cache()
 
     def _trim_mlx_cache(self):
         # Loading, quantizing and probing leaves roughly 1.5GB of reusable MLX
@@ -730,9 +883,8 @@ class MRTEngine:
         # that headroom back to the OS to avoid swap-driven frame spikes.
         if self.mlx_cache_mb <= 0:
             return
-        try:
-            mx = self._mx if self._fast else __import__("mlx.core", fromlist=["core"])
-        except (ImportError, AttributeError):
+        mx = self._mlx_module()
+        if mx is None:
             return
         before = mx.get_cache_memory()
         mx.set_cache_limit(self.mlx_cache_mb * 1024 * 1024)
@@ -765,9 +917,11 @@ class MRTEngine:
             self._require_audio_quality(quality_pcm)
             return
 
-        # One global burn-in is enough: changing the active count changes loop
-        # length, not tensor/kernel shapes. A 25-frame probe gives calibration
-        # a stable throughput estimate; live chunks are shorter for latency.
+        # One global burn-in is enough for the eager path, and _prewarm has
+        # already traced every count the compiled path can reach, so nothing
+        # timed below includes a first-call cost. A 25-frame probe gives
+        # calibration a stable throughput estimate; live chunks are shorter
+        # for latency.
 
         if self.pinned_codebooks:
             self.set_codebooks(self.pinned_codebooks)
@@ -982,20 +1136,25 @@ class MRTEngine:
         # A plan contains ConditioningRun values (legacy four-tuples are still
         # accepted). Style, score, drum, and control boundaries split it only
         # where conditioning actually changes.
+        #
+        # Every frame's tokens are sampled first; the codec then decodes the
+        # whole chunk in one call. The listener receives the chunk at the same
+        # moment either way, and the codec costs about a third as much.
         self._raise_if_stopping()
         if not self._fast:
             return self._generate_stock(state, plan, seed=seed)
 
         mx = self._mx
-        sampler = self._sampler
+        renderer = self._renderer
         if state is None:
             state = self._new_eager_state(seed)
 
-        outputs = []
+        stepper = renderer.stepper(state[0])
+        codec_state = tuple(state[1:])
+        frame_tokens = []
         # the graph mlx is still working on. handing it to async_eval and only
         # blocking on it one step later lets this thread build the next frame
-        # while the gpu renders this one - worth about 20% of wall clock, and
-        # bit for bit the same audio as blocking on every frame.
+        # while the gpu renders this one.
         pending = None
 
         for run in plan:
@@ -1004,6 +1163,7 @@ class MRTEngine:
             block, constants = self._conditioning(
                 style, key, notes, drum=drum, sampling=sampling
             )
+            encoded = renderer.encode(block, stepper.encoder_state, constants)
             for _ in range(frames):
                 if self._stop_requested.is_set():
                     # Do not leave an already-submitted GPU operation running
@@ -1011,28 +1171,26 @@ class MRTEngine:
                     if pending is not None:
                         mx.eval(pending)
                     self._raise_if_stopping()
-                step, state, _ = sampler.step_with_emits(
-                    x=block, state=state, constants=constants, training=False
-                )
+                tokens, targets = stepper.step(block, encoded, constants)
                 # the streaming state goes in too: left lazy it would pile up a
                 # graph across the whole chunk rather than settling each frame
-                mx.async_eval(
-                    step.values,
-                    state,
-                )
+                mx.async_eval(*targets)
                 if pending is not None:
                     mx.eval(pending)
-                pending = step.values
-                outputs.append(step)
+                pending = tokens
+                frame_tokens.append(tokens)
 
-        if pending is not None:
-            mx.eval(pending)
+        if not frame_tokens:
+            return b"", state
 
-        # the sampler's last layer already emits int16, interleaved as
-        # [frames * 1920, 2] - so this is a copy out of mlx and nothing else.
-        # the old path round-tripped it through float32 and back for nothing.
-        samples = np.asarray(self._sl.Sequence.concatenate_sequences(outputs).values[0])
-        return np.ascontiguousarray(samples, dtype=np.int16).tobytes(), state
+        pcm, codec_state = renderer.decode(frame_tokens, codec_state)
+        next_state = (stepper.final_state(), *codec_state)
+        mx.eval(pcm, *flatten_state(next_state, mx)[0])
+
+        # the codec's last layer already emits int16 as [1, frames * 1920, 2] -
+        # so this is a copy out of mlx and nothing else.
+        samples = np.asarray(pcm[0])
+        return np.ascontiguousarray(samples, dtype=np.int16).tobytes(), next_state
 
     def _new_eager_state(self, seed: int | None):
         """Create the pinned eager sampler state with an optional decoder seed."""
@@ -1080,7 +1238,7 @@ class MRTEngine:
         for run in plan:
             self._raise_if_stopping()
             style, _key, notes, frames, drum, sampling = self._run_parts(run)
-            style_tokens = list(self._system._style_model.tokenize(style))
+            style_tokens = self.tokenize_style(style)
             style_tokens[self.style_token_levels :] = [-1] * (
                 len(style_tokens) - self.style_token_levels
             )
@@ -1123,6 +1281,9 @@ class MRTEngine:
         self._input_spec = None
         self._depth_config = None
         self._keepalive_value = None
+        self._renderer = None
+        self._tokenizer = None
+        self._released_interpreters = []
         self._system = None
         self._fast = False
         self._fast_sampling = False

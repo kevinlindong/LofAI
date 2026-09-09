@@ -358,27 +358,15 @@ def install(system, mx, sl) -> FastEngineStatus | None:
             dummy_cache[key] = value
         return value
 
-    def fast_step(self, x, state, *, forced_tokens=None, training=False, constants=None):
-        constants = constants or {}
-        if (
-            training
-            or forced_tokens is not None
-            or x.shape[0] != 1
-            or any(key.startswith(_CFG_SCALE_PREFIX) for key in constants)
-        ):
-            return original_step(
-                x, state, forced_tokens=forced_tokens, training=training,
-                constants=constants,
-            )
+    def sample_step(self, encoded, state, constants):
+        """Sample one frame of tokens from already-encoded conditioning.
 
+        ``state`` is the sampler layer's own state tuple. The conditioning
+        encoder has already run (``encoded``), so this half of the step is a
+        pure function of arrays: that is what lets ``compiled_engine`` trace
+        it with ``mx.compile`` while the eager path keeps the encoder cache.
+        """
         encoder_state, _previous_output, sampler_state, delay_countdown = state
-
-        if cache_encoder:
-            encoded = encode_block(x, encoder_state, constants)
-        else:
-            encoded, encoder_state = self.encoder.body.step(
-                x, encoder_state, training=False, constants=constants
-            )
         sampler_constants = dict(constants)
         sampler_constants[conditioning_name] = encoded
 
@@ -447,11 +435,38 @@ def install(system, mx, sl) -> FastEngineStatus | None:
         # the upstream where() plumbing reduces to pass-through.
         return tokens, (encoder_state, tokens, sampler_state, delay_countdown)
 
+    def fast_step(self, x, state, *, forced_tokens=None, training=False, constants=None):
+        constants = constants or {}
+        if (
+            training
+            or forced_tokens is not None
+            or x.shape[0] != 1
+            or any(key.startswith(_CFG_SCALE_PREFIX) for key in constants)
+        ):
+            return original_step(
+                x, state, forced_tokens=forced_tokens, training=training,
+                constants=constants,
+            )
+
+        encoder_state = state[0]
+        if cache_encoder:
+            encoded = encode_block(x, encoder_state, constants)
+        else:
+            encoded, encoder_state = self.encoder.body.step(
+                x, encoder_state, training=False, constants=constants
+            )
+            state = (encoder_state, *state[1:])
+        return sample_step(self, encoded, state, constants)
+
     import types as types_module
 
     layer0.step = types_module.MethodType(fast_step, layer0)
     layer0._lofai_fast_engine = status
     layer0._lofai_original_step = original_step
+    # The two halves of the step, for callers that want to run the encoder
+    # once per conditioning block and trace only the sampling half.
+    layer0._lofai_encode = encode_block
+    layer0._lofai_sample_step = types_module.MethodType(sample_step, layer0)
     status.step_specialized = True
     log.info("fast engine installed: %s", status.summary())
     return status

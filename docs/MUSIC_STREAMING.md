@@ -90,12 +90,86 @@ the real-time hot loop.
 | `backend/take_health.py` | Watch each take's quiet-moment floor and detect a self-amplifying hiss bed; provide the crossfade splice |
 | `backend/engine.py` | Load MRT2, cache conditioning, render frames, measure speed, and tune codec depth |
 | `backend/fast_engine.py` | Specialize the pinned magenta-rt streaming step: sliced logits, cached conditioning encoding, hoisted constants, clean RVQ truncation |
+| `backend/compiled_engine.py` | Render a chunk as tokens first, then one batched codec call; trace both halves with `mx.compile`; keep session state detached from chunk activations |
+| `backend/style_tokens.py` | NumPy replica of MusicCoCa's RVQ tokenizer, verified against TFLite, so the interpreters can be released after startup |
 | `backend/styles.py` | Define the four listener-facing MusicCoCa prompts and optional audio references |
 
 `composition.py`, `melody.py`, and `backend/evaluation/` are deliberately
 outside that table: they support offline listening experiments, not playback.
 
 ## What made the previous stream slow
+
+### September 2026: where a frame actually went
+
+A stage-by-stage measurement of one 12-codebook frame on an M3 Pro (18 GB,
+8-bit weights, barrier after each stage) corrected the earlier picture:
+
+| Stage | ms | Note |
+|---|---:|---|
+| Conditioning encoder | 0.2 | cached per block |
+| Temporal body (12 layers, 1024-d) | 4.9 | about 200 MB of weight reads |
+| Depth loop (12 sequential steps) | 6.6 | 14.8 with a barrier after every step, which is how the earlier profile attributed "14 of 24 ms" here |
+| SpectroStream codec, one frame | 10.3 | 143 MB of float32 Conv2D plus the iSTFT, run at T = 1 |
+| Python graph construction | 5.6 | on the critical path; `async_eval` hides only part of it |
+
+Two findings drove the changes. First, `nn.quantize` never touches the
+codec: it converts `nn.Linear`/`nn.Embedding` and the attention modules'
+own `to_quantized` hooks, so the 143 MB conv decoder and the 67 MB RVQ table
+stay float32 and are read in full every 40 ms. Per-frame weight traffic is
+roughly 540 MB, which on an M1's ~68 GB/s is an ~8 ms floor before any
+kernel launch or Python overhead. Second, the codec - not the depth loop -
+was the largest single stage.
+
+**Batched codec.** The codec is causal convolution, not autoregression: its
+`step` over a ten-frame token sequence yields the same samples as ten
+single-frame steps (measured: 1 LSB over 600k samples), at 2.9 instead of
+10.0 ms per frame. `compiled_engine.ChunkRenderer` therefore samples every
+frame's tokens first and decodes the chunk in one call. Latency is
+unchanged: `generate()` already returned whole chunks. The one trap was
+memory: the codec's returned streaming state consists of slices into the
+chunk's activations, and MLX slices share their donor buffer, so a naive
+version pinned about a gigabyte per listener between chunks. State leaves
+are now copied out with `mx.contiguous` before they leave the renderer, and
+the flatten/rebuild helpers avoid self-referential closures, which had been
+holding those same views hostage to the cyclic garbage collector.
+
+**Compiled step.** The sampling half of the specialized step (the encoder
+runs once per block outside the trace) and the batched codec are traced
+with `mx.compile`, with sequence_layers' `Sequence`-bearing state flattened
+to arrays at the boundary. Python time per depthformer frame fell from 4.3
+to 0.55 ms and the step from 12.5 to 7.2 ms; fused kernels, not just less
+Python. The active codebook count is Python control flow inside the step, so
+one trace is kept per count, and every live chunk length is traced during
+calibration (`prewarm`, about 0.6 s for three counts at two lengths).
+Compiled output is not bit-identical: from an identical state, compiled and
+eager tokens differed in 10 of 60 single steps, all in the flat-distribution
+deep codebooks, with a total variation distance of about 0.03 on the
+sampling distribution and the same argmax and top-5. The already-shipped
+sliced-logits step differs from the stock library in 30 of 30 frames, so
+this is the same class of trade. `MRT_COMPILE=0` restores the eager step.
+
+Combined, on the M3 Pro at 12 codebooks: 18.8 → 8.5 ms per frame (2.2x),
+with the codebook dial now worth about 0.3 ms per step. The M1 Air was not
+available for measurement; both changes attack costs that scale with memory
+bandwidth and CPU speed, which the M1 has less of, so the relative gain
+should be at least as large there. Casting the codec to fp16/bf16 was also
+tried and dropped: 0.7 ms per frame at best, and the conv decoder's output
+did not survive the cast cleanly.
+
+**Memory.** The MusicCoCa TFLite interpreters (text encoder, mapper,
+quantizer) stayed resident for the life of the process - about 900 MB on a
+cold start - and JAX is imported by the vendored `sequence_layers.mlx`
+(~230 MB). The RVQ quantizer graph turned out to be a plain 12-level
+residual nearest-neighbour search; `style_tokens.py` extracts its codebooks,
+verifies its own tokens against the interpreter on random vectors, the
+station embeddings, and their ramp blends (956 of 956 agreed locally), and
+caches them next to the embeddings. With tokenization native, the engine
+releases every interpreter after warm-up; they rebuild lazily if an unknown
+prompt arrives. The MLX buffer cache limit is applied from the first
+allocation rather than after calibration, which removed a 1.5-3 GB startup
+transient. Cold start settled at about 1.0 GB resident versus 1.7 GB before;
+the JAX import remains, since `sequence_layers.mlx` uses it for its config
+base classes.
 
 ### September 2026 audit of the installed runtime
 
