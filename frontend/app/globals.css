@@ -1113,6 +1113,23 @@
     inset: 0;
     display: block;
   }
+
+  .site-shell .companion-card {
+    padding: clamp(0.75rem, 1.5vw, 1rem);
+  }
+
+  .site-shell .pet-stage {
+    border-radius: 1rem;
+  }
+
+  .site-shell .pet-stage::after {
+    position: absolute;
+    inset: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: inherit;
+    content: "";
+    pointer-events: none;
+  }
 }
 
 .dot-scroll {
