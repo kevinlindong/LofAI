@@ -78,7 +78,7 @@ function VariationButton() {
   )
 }
 
-function StationList({ layout = "list" }: { layout?: "list" | "tiles" | "keys" | "pills" }) {
+function StationList({ layout = "list" }: { layout?: "list" | "tiles" | "keys" }) {
   const { controls, setControls, isLive } = useRadio()
   return (
     <div className={`station-selector stations-${layout}`} role="group" aria-label="Choose your station">
@@ -270,21 +270,6 @@ function Signal({ preferences }: { preferences: Preferences }) {
   )
 }
 
-function Afterglow({ openWorkspace }: { openWorkspace: () => void }) {
-  const { controls } = useRadio()
-  const station = STATION_PRESETS.find((entry) => entry.id === controls.station)!
-  return (
-    <div className="afterglow-listening" id="radio">
-      <div className="afterglow-heading"><p className="design-eyebrow">For the hours that belong to you</p><h1>Let the world wait.<br /><em>Stay a little longer.</em></h1></div>
-      <div className="afterglow-center"><span className="orbital-note orbital-note-left">NO DESTINATION<br />JUST A LITTLE DRIFT</span><RecordPlayer /><span className="orbital-note orbital-note-right">ENDLESS SOUND<br />A MOMENT OF YOUR OWN</span></div>
-      <div className="afterglow-track"><h2>{station.label}</h2><Status /></div>
-      <StationList layout="pills" />
-      <div className="afterglow-dock"><Mixer /><VariationButton /></div>
-      <div className="afterglow-bottom"><SleepTimer /><button type="button" onClick={openWorkspace}><DotGlyph name="timer" dot={1} /> A little space to focus <span>↗</span></button></div>
-    </div>
-  )
-}
-
 function Customization({ design, preferences, updatePreferences, dialogRef }: {
   design: NewDesign; preferences: Preferences; updatePreferences: (next: Partial<Preferences>) => void; dialogRef: React.RefObject<HTMLDialogElement>
 }) {
@@ -334,7 +319,6 @@ export function DesignWorkspace({ design }: { design: NewDesign }) {
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES)
   const [storageNotice, setStorageNotice] = useState("")
   const dialogRef = useRef<HTMLDialogElement>(null)
-  const workspaceDialogRef = useRef<HTMLDialogElement>(null)
 
   useEffect(() => {
     try {
@@ -356,8 +340,7 @@ export function DesignWorkspace({ design }: { design: NewDesign }) {
   }
 
   const openWorkspace = () => {
-    if (design.slug === "afterglow") workspaceDialogRef.current?.showModal()
-    else document.getElementById("workspace")?.scrollIntoView({ behavior: "smooth", block: "start" })
+    document.getElementById("workspace")?.scrollIntoView({ behavior: "smooth", block: "start" })
   }
 
   return (
@@ -369,12 +352,10 @@ export function DesignWorkspace({ design }: { design: NewDesign }) {
         {design.slug === "sunday" && <Sunday preferences={preferences} />}
         {design.slug === "form" && <Form preferences={preferences} />}
         {design.slug === "signal" && <Signal preferences={preferences} />}
-        {design.slug === "afterglow" && <Afterglow openWorkspace={openWorkspace} />}
         <footer className="design-footer"><span>lofAI — {design.description}</span><span>Made for being here.<span className="footer-star" aria-hidden="true">✳</span></span></footer>
       </div>
       <Customization design={design} preferences={preferences} updatePreferences={updatePreferences} dialogRef={dialogRef} />
       {storageNotice && <p className="storage-notice" role="status">{storageNotice}</p>}
-      {design.slug === "afterglow" && <dialog ref={workspaceDialogRef} className="workspace-dialog" aria-labelledby="workspace-title" onClick={(event) => { if (event.target === event.currentTarget) workspaceDialogRef.current?.close() }}><div className="workspace-dialog-inner"><div className="dialog-heading"><div><p className="design-eyebrow">A little room for your thoughts</p><h2 id="workspace-title">Your quiet corner.</h2></div><button type="button" className="close-button" aria-label="Close workspace" onClick={() => workspaceDialogRef.current?.close()}><DotGlyph name="cross" dot={2} /></button></div><Widgets preferences={preferences} layout="column" /></div></dialog>}
     </main>
   )
 }

@@ -114,37 +114,6 @@ html.design-signal {
   --shadow: 0 25px 70px #292c2529;
   --shadow-soft: none;
 }
-html.design-afterglow {
-  color-scheme: dark;
-  --bg: #17141e;
-  --bg-deep: #100e16;
-  --surface: #211c2b;
-  --surface-strong: #282131;
-  --surface-soft: #2e263a;
-  --control: #302738;
-  --text: #f0eaf5;
-  --text-dim: #b1a4bc;
-  --text-faint: #a394b1;
-  --accent: #b9a0de;
-  --accent-deep: #c6b2e2;
-  --accent-2: #aa8dba;
-  --accent-ink: #281b3b;
-  --line-color: #ffffff1c;
-  --line-strong: #ffffff35;
-  --good: #a3c9a2;
-  --bad: #efa595;
-  --dot-0: #302537;
-  --dot-1: #4f3b60;
-  --dot-2: #755688;
-  --dot-3: #9472ae;
-  --dot-4: #b59acf;
-  --dot-5: #dcc6ed;
-  --dot-6: #bb93af;
-  --dot-7: #46324d;
-  --shadow: 0 30px 100px #0005;
-  --shadow-soft: none;
-}
-
 html.design-sunday.design-tone-alternate {
   --accent: #555c3b; --accent-deep: #555c3b; --accent-2: #87916b;
   --record-bg: #e4e5d8; --dot-1: #c1c5a9; --dot-2: #969d79;
@@ -171,20 +140,7 @@ html.design-signal.design-tone-mono {
   --signal-light: #dadbd4; --accent: #4c514a; --accent-deep: #4c514a; --accent-2: #7e857a;
   --dot-1: #555b50; --dot-2: #7e8478; --dot-3: #a3a99c; --dot-4: #ced1c5; --dot-5: #eef0e5; --dot-6: #b7beb0;
 }
-html.design-afterglow.design-tone-alternate {
-  --bg: #111b1e; --bg-deep: #0c1519; --surface: #1c2c30; --surface-strong: #25373a;
-  --surface-soft: #294044; --control: #263b3e; --accent: #8ec7c0; --accent-deep: #a2d8d1;
-  --accent-2: #85a8b8; --accent-ink: #102f34; --text-dim: #a5bdc0; --text-faint: #8faeb1;
-  --dot-0: #253b3f; --dot-1: #355963; --dot-2: #50818a; --dot-3: #71a4ac; --dot-4: #92c7c4; --dot-5: #c0e8de; --dot-6: #80afb0;
-}
-html.design-afterglow.design-tone-mono {
-  --bg: #191b1c; --bg-deep: #111314; --surface: #252729; --surface-strong: #303233;
-  --surface-soft: #373b3b; --control: #313535; --accent: #c9c8c5; --accent-deep: #d8d7d2;
-  --accent-2: #a8aaa8; --accent-ink: #252828; --text-dim: #b2b7b5; --text-faint: #a0a5a3;
-  --dot-0: #323737; --dot-1: #4e5554; --dot-2: #727b79; --dot-3: #969f9c; --dot-4: #bec6c1; --dot-5: #e4eae3; --dot-6: #a7b2aa;
-}
-
-html:is(.design-sunday, .design-form, .design-signal, .design-afterglow) body { background: var(--bg); }
+html:is(.design-sunday, .design-form, .design-signal) body { background: var(--bg); }
 .design-view {
   position: relative;
   min-height: 100vh;
@@ -521,56 +477,6 @@ html:is(.design-sunday, .design-form, .design-signal, .design-afterglow) body { 
 .view-signal .companion-card .companion-dot { background: var(--signal-light); }
 .view-signal .pet-stage { max-width: 210px; }
 
-/* 05 / AFTERGLOW — an immersive, unhurried listening space. */
-.view-afterglow { overflow: hidden; min-height: 100svh; padding-inline: 4vw; background: radial-gradient(ellipse at 50% 42%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 48%), var(--bg); }
-.view-afterglow::before { content: ""; position: absolute; top: 110px; left: calc(50% - 550px); width: 1100px; height: 720px; border: 1px solid color-mix(in srgb, var(--accent) 6%, transparent); border-radius: 50%; transform: rotate(-17deg); pointer-events: none; }
-.view-afterglow .ascii-ambience { opacity: .6; }
-.view-afterglow .design-header { min-height: 88px; border-color: #ffffff0e; }
-.view-afterglow .design-brand > span:first-child { font-family: "Instrument Serif", Georgia, serif; font-size: 35px; font-weight: 400; }
-.view-afterglow .brand-edition { font-family: "Instrument Serif", Georgia, serif; font-size: 22px; font-style: italic; letter-spacing: 0; border-color: #ffffff30; }
-.view-afterglow .design-switcher a[aria-current] { background: #ffffff0b; border: 1px solid var(--accent); color: var(--accent); }
-.view-afterglow .customize-button { border-radius: 50px; border-color: #ffffff27; padding-inline: 17px; }
-.view-afterglow .workspace-link { color: var(--text-dim); }
-.afterglow-listening { display: flex; align-items: center; flex-direction: column; position: relative; padding-top: 39px; }
-.afterglow-heading { text-align: center; z-index: 1; }
-.afterglow-heading .design-eyebrow { font-size: 10px; font-weight: 400; letter-spacing: .23em; }
-.afterglow-heading h1 { font-family: "Instrument Serif", Georgia, serif; font-size: clamp(44px, 4.3vw, 64px); line-height: 1.04; letter-spacing: -.025em; font-weight: 400; margin-top: 17px; }
-.afterglow-heading h1 em { font-weight: 400; color: var(--accent); }
-.afterglow-center { display: grid; position: relative; place-items: center; width: min(100%, 870px); margin-top: -18px; }
-.afterglow-center .record-stage { max-width: 430px; }
-.afterglow-center .record-orbit { position: absolute; width: 82%; aspect-ratio: 1; border: 1px solid color-mix(in srgb, var(--accent) 10%, transparent); border-radius: 50%; box-shadow: 0 0 0 16px color-mix(in srgb, var(--accent) 1%, transparent), 0 0 0 17px color-mix(in srgb, var(--accent) 6%, transparent); }
-.afterglow-center .record-wordmark { font-size: 31px; color: var(--accent); }
-.afterglow-center .record-center { gap: 14px; }
-.afterglow-center .design-play { width: 54px; height: 54px; border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--accent); box-shadow: 0 0 30px color-mix(in srgb, var(--accent) 8%, transparent); }
-.afterglow-center .design-play:hover { background: var(--accent); color: var(--bg); }
-.afterglow-center .record-caption { font-size: 9px; color: var(--text-dim); letter-spacing: .04em; }
-.orbital-note { position: absolute; top: 46%; font-size: 9px; color: var(--text-faint); line-height: 1.9; font-weight: 400; letter-spacing: .17em; }
-.orbital-note-left { left: 0; }.orbital-note-right { right: 0; text-align: right; }
-.orbital-note::before { content: "+"; display: block; font-size: 14px; margin-bottom: 15px; color: var(--accent); }
-.afterglow-track { display: flex; flex-direction: column; align-items: center; gap: 7px; text-align: center; margin-top: -24px; }
-.afterglow-track h2 { font-family: "Instrument Serif", Georgia, serif; font-size: 27px; line-height: 1.1; font-weight: 400; }
-.afterglow-track .radio-status { max-width: 400px; font-size: 10px; }
-.stations-pills { display: flex; gap: 22px; margin: 25px 0 21px; }
-.stations-pills .station-option { position: relative; width: auto; gap: 7px; min-height: 35px; color: var(--text-dim); padding-bottom: 7px; }
-.stations-pills .station-copy strong { font-size: 11px; font-weight: 400; white-space: nowrap; }
-.stations-pills .station-copy > span, .stations-pills .station-indicator { display: none; }
-.stations-pills .station-index { font-size: 9px; color: var(--text-faint); }
-.stations-pills .station-option.is-selected { color: var(--text); }
-.stations-pills .station-option.is-selected::after { content: ""; position: absolute; bottom: 0; left: calc(50% - 2px); width: 4px; height: 4px; border-radius: 50%; background: var(--accent); }
-.afterglow-dock { display: flex; align-items: center; gap: 26px; width: min(100%, 530px); padding: 7px 23px; border: 1px solid #ffffff1b; border-radius: 50px; background: color-mix(in srgb, var(--surface) 55%, transparent); backdrop-filter: blur(12px); box-shadow: 0 10px 40px #0001; }
-.afterglow-dock .design-mixer { flex: 1; min-width: 0; padding-block: 12px; border: 0; }
-.afterglow-dock .variation-button { font-size: 10px; gap: 6px; }
-.afterglow-dock .variation-button > span:last-child { margin-left: 3px; }
-.afterglow-dock .drum-switch { font-size: 10px; gap: 6px; }
-.afterglow-dock .drum-switch > span:last-child { display: none; }
-.afterglow-dock .flow-range-thumb { border-color: var(--surface-soft); }
-.afterglow-bottom { display: flex; align-items: center; justify-content: space-between; gap: 32px; width: min(100%, 530px); margin-top: 18px; }
-.afterglow-bottom > button { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--text-dim); min-height: 36px; }
-.afterglow-bottom .sleep-control { font-size: 10px; gap: 7px; }
-.afterglow-bottom .sleep-control select { font-size: 10px; border-color: #ffffff1c; }
-.view-afterglow .design-footer { border: 0; margin-top: 14px; padding-block: 19px; font-size: 10px; }
-.view-afterglow .footer-star { font-size: 17px; }
-
 /* Native dialogs provide focus containment, Escape, and focus restoration. */
 .design-view dialog { color: var(--text); border: 1px solid var(--line-strong); background: var(--bg); box-shadow: var(--shadow); max-height: min(90dvh, 880px); margin: auto; padding: 0; overflow-y: auto; overscroll-behavior: contain; }
 .design-view dialog::backdrop { background: #10140f77; backdrop-filter: blur(6px); }
@@ -609,12 +515,6 @@ html:is(.design-sunday, .design-form, .design-signal, .design-afterglow) body { 
 .keyboard-hints { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--line-color); font-size: 10px; color: var(--text-dim); }
 .keyboard-hints kbd { font-family: inherit; border: 1px solid var(--line-color); border-radius: 2px; padding: 2px 4px; margin-right: 3px; }
 .storage-notice { position: fixed; z-index: 20; bottom: 20px; left: 20px; right: 20px; width: fit-content; padding: 12px 18px; border: 1px solid var(--line-color); background: var(--surface-strong); font-size: 13px; }
-.design-view .workspace-dialog { position: fixed; max-height: 100dvh; height: 100dvh; width: min(420px, 100vw); margin: 0 0 0 auto; border-width: 0 0 0 1px; border-radius: 0; }
-.workspace-dialog-inner { padding: 24px; }
-.workspace-dialog .dialog-heading { margin-bottom: 28px; }
-.workspace-dialog .dialog-heading h2 { font-size: 33px; }
-.workspace-dialog .widget { border-radius: 6px; background: var(--surface); }
-.workspace-dialog .tasks-card { min-height: 200px; }
 html:has(.design-view dialog[open]) { overflow: hidden; }
 
 @keyframes station-level { from { transform: scaleY(.45); } to { transform: scaleY(1.2); } }
@@ -622,7 +522,6 @@ html:has(.design-view dialog[open]) { overflow: hidden; }
 @media (min-width: 1500px) {
   .sunday-heading { padding-block: 48px; }
   .sunday-record .record-stage > .aspect-square { max-width: 470px; }
-  .afterglow-listening { padding-top: 50px; }
 }
 @media (max-width: 1180px) {
   .design-header-actions { gap: 14px; }
@@ -654,7 +553,6 @@ html:has(.design-view dialog[open]) { overflow: hidden; }
   .receiver-body { gap: 22px; }
   .receiver-logo > span { display: none; }
   .receiver-controls .design-mixer { gap: 10px; }
-  .orbital-note-left { left: 3%; }.orbital-note-right { right: 3%; }
 }
 @media (max-width: 960px) {
   .design-header { gap: 12px; min-height: 85px; }
@@ -713,7 +611,6 @@ html:has(.design-view dialog[open]) { overflow: hidden; }
   .receiver-controls .drum-switch { gap: 5px; padding-left: 8px; }
   .receiver-controls .drum-switch > span:last-child { display: none; }
   .view-signal .widget .tabular-nums { font-size: 36px !important; }
-  .orbital-note { font-size: 9px; }
 }
 @media (max-width: 700px) {
   .design-view { padding-inline: 22px; }
@@ -806,23 +703,6 @@ html:has(.design-view dialog[open]) { overflow: hidden; }
   .receiver-controls .drum-switch > span:last-child { display: block; }
   .view-signal .widget { padding-inline: 16px; }
   .view-signal .widget .tabular-nums { font-size: 39px !important; }
-  .view-afterglow .design-header { min-height: 80px; }
-  .view-afterglow .design-brand > span:first-child { font-size: 30px; }
-  .view-afterglow .brand-edition { font-size: 17px; padding-left: 10px; }
-  .view-afterglow .customize-button { padding-inline: 0; }
-  .afterglow-listening { padding-top: 36px; }
-  .afterglow-heading h1 { font-size: 47px; }
-  .afterglow-heading .design-eyebrow { font-size: 9px; }
-  .afterglow-center { margin-top: -4px; }
-  .afterglow-center .record-stage { max-width: 390px; }
-  .orbital-note { display: none; }
-  .afterglow-track { margin-top: -10px; }
-  .afterglow-dock { gap: 18px; padding-inline: 20px; }
-  .afterglow-bottom { width: 100%; gap: 12px; }
-  .afterglow-bottom > button { font-size: 9px; gap: 5px; }
-  .stations-pills { gap: 19px; }
-  .stations-pills .station-copy strong { font-size: 11px; }
-  .view-afterglow .design-footer { margin-top: 25px; }
   .design-footer { font-size: 10px; padding-block: 22px; }
 }
 @media (max-width: 440px) {
@@ -917,32 +797,6 @@ html:has(.design-view dialog[open]) { overflow: hidden; }
   .signal-rack-label { font-size: 9px; letter-spacing: .08em; }
   .view-signal .widget { padding: 22px; }
   .view-signal .widget .tabular-nums { font-size: 55px !important; }
-  .view-afterglow .design-header { min-height: 110px; }
-  .view-afterglow .design-header-actions .customize-button { font-size: 10px; padding-inline: 10px; }
-  .afterglow-listening { padding-top: 35px; }
-  .afterglow-heading h1 { font-size: 43px; margin-top: 15px; }
-  .afterglow-heading .design-eyebrow { font-size: 9px; }
-  .afterglow-center { margin-block: 8px; }
-  .afterglow-center .record-center { gap: 10px; }
-  .afterglow-center .record-wordmark { font-size: 26px; }
-  .afterglow-center .design-play { width: 47px; height: 47px; }
-  .afterglow-center .record-caption { font-size: 8px; }
-  .afterglow-track { margin-top: -10px; }
-  .afterglow-track h2 { font-size: 24px; }
-  .stations-pills { flex-wrap: wrap; justify-content: center; gap: 5px 21px; max-width: 290px; margin: 19px 0; }
-  .stations-pills .station-option { min-height: 32px; }
-  .stations-pills .station-copy strong { font-size: 11px; }
-  .afterglow-dock { padding: 5px 14px; gap: 11px; }
-  .afterglow-dock .design-mixer { gap: 9px; }
-  .afterglow-dock .mute-button { min-width: 18px; }
-  .afterglow-dock .drum-switch { padding-left: 8px; gap: 5px; }
-  .afterglow-dock .variation-button > span:last-child { display: none; }
-  .afterglow-dock .variation-button { font-size: 9px; gap: 5px; }
-  .afterglow-dock .mixer-volume .label { font-size: 9px; }
-  .afterglow-dock .drum-switch { flex-direction: column; justify-content: center; font-size: 9px; }
-  .afterglow-bottom { flex-direction: column; gap: 2px; margin-top: 17px; }
-  .afterglow-bottom > button { font-size: 10px; }
-  .view-afterglow .design-footer { font-size: 9px; }
   .design-footer { gap: 10px; font-size: 9px; margin-top: 25px; }
   .design-footer > span:last-child { gap: 10px; }
   .footer-star { font-size: 19px; }
@@ -950,7 +804,6 @@ html:has(.design-view dialog[open]) { overflow: hidden; }
   .dialog-heading h2 { font-size: 30px; }
   .customization-dialog .scene-presets button { font-size: 10px; padding-inline: 7px; }
   .keyboard-hints { gap: 11px; font-size: 9px; }
-  .workspace-dialog-inner { padding: 23px 18px; }
   .sleep-expanded { flex-wrap: wrap; font-size: 12px; }
 }
 @media (prefers-reduced-motion: reduce) {
