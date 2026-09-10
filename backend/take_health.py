@@ -105,6 +105,16 @@ EVALUATION_SECONDS = 0.4
 SUSTAIN_SECONDS = 30.0
 SUSTAIN_FRACTION = 0.8
 
+# Drift accumulates with age while healthy brightening happens early, when
+# an arrangement is still building. Once a take is this old, a smaller rise
+# counts and it need not hold as long: a young take must sustain a
+# HIGH_BAND_RISE_DB rise for SUSTAIN_SECONDS; a mature one is cut after
+# MATURE_SUSTAIN_SECONDS of MATURE_RISE_DB. Every measured runaway that
+# reached its threshold late kept climbing from there.
+MATURE_TAKE_SECONDS = 150.0
+MATURE_RISE_DB = 8.0
+MATURE_SUSTAIN_SECONDS = 10.0
+
 # Both measured runaway textures live above 5 kHz: the sparse-station hiss
 # spans 3-13 kHz and the busy-station bed 14-20 kHz. Starting lower than
 # 5 kHz reads brushed snares and guitar harmonics as hiss on jazz-cafe;
@@ -148,7 +158,7 @@ class TakeFloorMonitor:
         self._seen_blocks = 0
         self._evaluation_blocks = max(1, round(EVALUATION_SECONDS / BLOCK_SECONDS))
         self._drift_votes: deque[bool] = deque(
-            maxlen=max(1, round(SUSTAIN_SECONDS / EVALUATION_SECONDS))
+            maxlen=max(1, round(max(SUSTAIN_SECONDS, MATURE_SUSTAIN_SECONDS) / EVALUATION_SECONDS))
         )
         self._remainder = np.empty((0, CHANNELS), dtype=np.float32)
         window = np.hanning(BLOCK_FRAMES).astype(np.float32)
@@ -218,21 +228,34 @@ class TakeFloorMonitor:
         floor, high_floor = _floor_profile(self._trailing_rms, self._trailing_high)
         del floor  # reported by describe(); the decision is spectral
         high_db = _dbfs(high_floor)
+        rise = (
+            high_db - _dbfs(self._baseline_high_floor)
+            if self._baseline_high_floor is not None
+            else None
+        )
+        mature = self._seen_blocks * BLOCK_SECONDS >= MATURE_TAKE_SECONDS
+        required_rise = MATURE_RISE_DB if mature else HIGH_BAND_RISE_DB
         # Loud enough to be hiss on any station, whatever the take began as.
         drifted = high_db >= RUNAWAY_HIGH_DBFS
-        if not drifted and self._baseline_high_floor is not None:
-            drifted = (
-                high_db >= MIN_AUDIBLE_HIGH_DBFS
-                and high_db - _dbfs(self._baseline_high_floor) >= HIGH_BAND_RISE_DB
-            )
+        if not drifted and rise is not None:
+            drifted = high_db >= MIN_AUDIBLE_HIGH_DBFS and rise >= required_rise
         self._drift_votes.append(drifted)
 
     @property
     def drifted(self) -> bool:
         votes = self._drift_votes
-        if len(votes) < votes.maxlen:
+        if not votes:
             return False
-        return sum(votes) >= SUSTAIN_FRACTION * votes.maxlen
+        # A mature take need not hold as long: drift only grows, and the
+        # relative test already required a real rise to vote at all. Count
+        # the most recent votes over whichever window currently applies.
+        mature = self._seen_blocks * BLOCK_SECONDS >= MATURE_TAKE_SECONDS
+        window_seconds = MATURE_SUSTAIN_SECONDS if mature else SUSTAIN_SECONDS
+        needed = max(1, round(window_seconds / EVALUATION_SECONDS))
+        if len(votes) < needed:
+            return False
+        recent = list(votes)[-needed:]
+        return sum(recent) >= SUSTAIN_FRACTION * needed
 
     @property
     def suspicious(self) -> bool:

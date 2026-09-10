@@ -25,6 +25,37 @@ DEFAULT_INSTRUMENT = "guitar"
 DEFAULT_STATION = "dusty-beats"
 CUSTOM_STATION = "custom"
 
+# A listener's free-text prompt is wrapped in this scaffold before it reaches
+# MusicCoCa. The station is a text-to-audio model, so a raw prompt can wander
+# anywhere; anchoring every request to "instrumental lo-fi" keeps the vibe of
+# the room while still letting the words steer instruments, mood, and texture.
+# MusicCoCa is a style encoder rather than an instruction follower, so we keep
+# the scaffold short and concrete for the same reason the curated prompts are.
+CUSTOM_PROMPT_PREFIX = "instrumental lo-fi"
+MAX_CUSTOM_PROMPT_CHARS = 120
+
+
+def scaffold_custom_prompt(text: str | None) -> str | None:
+    """Wrap a listener's free text in the lofi scaffold, or return None.
+
+    Returns ``None`` when the text is empty after trimming so callers fall back
+    to the mood/instrument mix. Control characters are stripped and the result
+    is length-capped: a long adjective pile-up dilutes MusicCoCa conditioning
+    rather than improving it.
+    """
+    if not isinstance(text, str):
+        return None
+    cleaned = " ".join(text.replace("\n", " ").split())
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable())
+    cleaned = cleaned.strip()[:MAX_CUSTOM_PROMPT_CHARS].strip()
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    # Avoid a doubled "lo-fi" if the listener already asked for it.
+    if "lo-fi" in lowered or "lofi" in lowered:
+        return cleaned
+    return f"{CUSTOM_PROMPT_PREFIX}, {cleaned}"
+
 
 @dataclass(frozen=True)
 class Station:
@@ -122,10 +153,14 @@ def prompt_for(
     mood: str,
     instrument: str,
     station: str = CUSTOM_STATION,
+    custom_prompt: str | None = None,
 ) -> str:
     station = normalize_station(station)
     if station != CUSTOM_STATION:
         return STATIONS[station].prompt
+    scaffolded = scaffold_custom_prompt(custom_prompt)
+    if scaffolded is not None:
+        return scaffolded
     return CUSTOM_PROMPTS[normalize(mood, instrument)]
 
 
@@ -157,12 +192,18 @@ def reference_map() -> dict[str, str]:
 def public_options() -> dict:
     return {
         "defaultStation": DEFAULT_STATION,
+        "customStation": CUSTOM_STATION,
         "stations": [asdict(station) for station in STATIONS.values()],
         "moods": list(MOODS),
         "instruments": list(INSTRUMENTS),
+        "maxCustomPromptChars": MAX_CUSTOM_PROMPT_CHARS,
         "limits": {
             "bpm": [60, 110],
             "groove": [0.0, 1.0],
             "intensity": [0.0, 1.0],
+            # Listener-facing granular dials, normalized 0..1. The backend maps
+            # them onto safe MusicCoCa guidance and sampler ranges.
+            "adherence": [0.0, 1.0],
+            "variation": [0.0, 1.0],
         },
     }

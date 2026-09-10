@@ -42,12 +42,26 @@ export interface StreamState {
 export interface ListenerControls {
   station: string
   drums: boolean
+  // Free-text style prompt; only meaningful for the custom station. Empty
+  // string means "use the selected station".
+  customPrompt: string
+  // Granular dials, normalized 0..1. The backend maps them onto safe
+  // MusicCoCa guidance (adherence) and sampler temperature (variation).
+  adherence: number
+  variation: number
 }
 
 export const DEFAULT_LISTENER_CONTROLS: ListenerControls = {
   station: "dusty-beats",
   drums: true,
+  customPrompt: "",
+  adherence: 0.5,
+  variation: 0.5,
 }
+
+// Keep the free-text prompt short: a long adjective pile-up dilutes MusicCoCa
+// conditioning rather than sharpening it, and the backend caps it anyway.
+export const MAX_CUSTOM_PROMPT_CHARS = 120
 
 interface Reservoir {
   prebufferSeconds: number
@@ -151,6 +165,11 @@ function clearSessionId() {
   }
 }
 
+function clamp01(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || Number.isNaN(value)) return fallback
+  return Math.max(0, Math.min(1, value))
+}
+
 function normalizedControls(
   next: Partial<ListenerControls>,
   previous: ListenerControls = DEFAULT_LISTENER_CONTROLS,
@@ -161,11 +180,23 @@ function normalizedControls(
         ? next.station.trim()
         : previous.station,
     drums: typeof next.drums === "boolean" ? next.drums : previous.drums,
+    customPrompt:
+      typeof next.customPrompt === "string"
+        ? next.customPrompt.replace(/\s+/g, " ").trimStart().slice(0, MAX_CUSTOM_PROMPT_CHARS)
+        : previous.customPrompt,
+    adherence: clamp01(next.adherence, previous.adherence),
+    variation: clamp01(next.variation, previous.variation),
   }
 }
 
 function controlsEqual(a: ListenerControls, b: ListenerControls): boolean {
-  return a.station === b.station && a.drums === b.drums
+  return (
+    a.station === b.station &&
+    a.drums === b.drums &&
+    a.customPrompt === b.customPrompt &&
+    a.adherence === b.adherence &&
+    a.variation === b.variation
+  )
 }
 
 function dbToGain(db: number): number {

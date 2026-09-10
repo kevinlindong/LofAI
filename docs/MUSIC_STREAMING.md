@@ -446,6 +446,36 @@ whose drift began late) and on neither healthy take; the closest healthy
 excursion, a brushed passage on jazz-cafe, reached +9.8 dB over its
 baseline for about a minute.
 
+Because drift accumulates with age while healthy brightening happens early
+(an arrangement still building), the sustain requirement scales with take
+age: a take under `MATURE_TAKE_SECONDS` (150 s) must hold a
+`HIGH_BAND_RISE_DB` (10 dB) rise for `SUSTAIN_SECONDS` (30 s), while an
+older one is cut after `MATURE_SUSTAIN_SECONDS` (10 s) of a smaller
+`MATURE_RISE_DB` (8 dB). On the captured takes this pulled each runaway's
+first cut earlier - the seed-777 no-drums take from 253 s to 230 s,
+jazz-cafe from 329 s to 158 s - without adding a fire on either healthy
+take.
+
+**Stronger conditioning is the primary fix; the guard is the backstop.**
+The guard is reactive: it must watch the floor rise for tens of seconds
+before it cuts, so every crossfade still lets some hiss through first.
+Re-measuring the sparse case against MusicCoCa guidance strength found a
+better lever. At the library's live default of `MRT_CFG_MUSICCOCA` 3.0 the
+rainy-piano no-drums take ran to -33 to -42 dBFS in band on every seed;
+at 4.0 the same seeds peaked near -60 dBFS and receded to -74 dBFS instead
+of running away, with quiet-block high-band share staying under about 6%,
+and at 5.0 they never rose above -53 dBFS. The prompt matters too, in the
+opposite direction from intuition: appending "clean quiet recording" to
+the rainy-piano prompt made it hiss *faster* (83% high-band share by 2.7
+minutes), because those tokens pull MusicCoCa toward recording noise.
+Busy stations (dusty-beats, jazz-cafe) were already stable at 3.0 and
+stayed stable at 4.0. CFG is encoded as conditioning tokens on the live
+path, so a higher scale costs no throughput. The default is now 4.0.
+Combined with the guard, a 10-minute rainy-piano no-drums take that
+previously reached -33 dBFS of static now holds a -54 to -74 dBFS
+high-band floor, the guard trimming it back to -74 dBFS two or three times
+across the take rather than letting it run away.
+
 The September audit found that folding PCM to mono before measuring it hid
 opposite-phase stereo hiss. The monitor now averages channel powers instead,
 and evaluates every 400 ms of audio rather than once per incoming chunk.

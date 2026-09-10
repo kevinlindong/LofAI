@@ -288,6 +288,25 @@ class TakeFloorMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.drifted)
         self.assertIn("warming", monitor.describe())
 
+    def test_mature_take_is_cut_on_a_rise_a_young_take_survives(self):
+        # Drift accumulates with age, so a mature take is cut on a shorter run
+        # of votes. Feed the same borderline (~9 dB) high-band rise for the
+        # same duration to a young take and to one already past
+        # MATURE_TAKE_SECONDS: only the mature take is cut.
+        def run(minutes_before_rise: float, rise_seconds: int) -> bool:
+            rng = np.random.default_rng(19)
+            monitor = TakeFloorMonitor()
+            for _ in range(int(minutes_before_rise * 60)):
+                _feed_seconds(monitor, _music_second(rng, -60.0, gap_hiss=True))
+            for _ in range(rise_seconds):
+                _feed_seconds(monitor, _music_second(rng, -51.0, gap_hiss=True))
+            return monitor.drifted
+
+        # ~40 s of rise: past the trailing-window fill plus the mature sustain,
+        # but short of the young take's full 30 s sustained fraction.
+        self.assertTrue(run(take_health.MATURE_TAKE_SECONDS / 60.0 + 0.2, 40))
+        self.assertFalse(run(1.0, 40))
+
 
 class CrossfadePcmTests(unittest.TestCase):
     def test_equal_power_crossfade_moves_old_to_new(self):

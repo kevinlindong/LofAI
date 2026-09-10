@@ -255,7 +255,11 @@ function loadStream(addModule, initialStorage = {}) {
 }
 
 const results = []
-const CONTROLS = Object.freeze({ station: "dusty-beats", drums: true })
+const DEFAULT_EXTRA = Object.freeze({ customPrompt: "", adherence: 0.5, variation: 0.5 })
+// The wire protocol carries the full normalized control set. Tests pass a
+// partial input and expect the defaults to be filled in on the socket.
+const withDefaults = (controls) => ({ ...DEFAULT_EXTRA, ...controls })
+const CONTROLS = Object.freeze({ station: "dusty-beats", drums: true, ...DEFAULT_EXTRA })
 async function test(name, exercise) {
   try {
     await exercise()
@@ -311,16 +315,16 @@ await test("hello and live updates use the minimal listener protocol", async () 
   assert.deepEqual(JSON.parse(socket.sent[0]), {
     type: "hello",
     sessionId: null,
-    ...controls,
+    ...withDefaults(controls),
   })
 
   const changed = {
     station: "jazz-cafe",
     drums: true,
   }
-  stream.setControls(changed)
+  stream.setControls(withDefaults(changed))
   const messages = socket.sent.slice(1).map((message) => JSON.parse(message))
-  assert.deepEqual(messages, [{ type: "controls", ...changed }])
+  assert.deepEqual(messages, [{ type: "controls", ...withDefaults(changed) }])
 
   await stream.destroy()
 })

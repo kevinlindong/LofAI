@@ -83,6 +83,63 @@ class MusicControlTests(unittest.TestCase):
             {station["slug"] for station in options["stations"]},
             set(styles.STATIONS),
         )
+        self.assertEqual(options["limits"]["adherence"], [0.0, 1.0])
+        self.assertEqual(options["limits"]["variation"], [0.0, 1.0])
+        self.assertEqual(options["customStation"], styles.CUSTOM_STATION)
+
+    def test_free_text_prompt_is_wrapped_in_the_lofi_scaffold(self):
+        controls = MusicControls.initial().update({"customPrompt": "rainy tokyo night"})
+        self.assertEqual(controls.station, "custom")
+        prompt = controls.prompt()
+        self.assertTrue(prompt.startswith("instrumental lo-fi,"))
+        self.assertIn("rainy tokyo night", prompt)
+
+    def test_free_text_prompt_selects_custom_station(self):
+        controls = MusicControls.initial(station="dusty-beats")
+        # A typed prompt with no explicit station switches to the custom mix.
+        controls = controls.update({"customPrompt": "warm vinyl saxophone"})
+        self.assertEqual(controls.station, "custom")
+
+    def test_scaffold_does_not_double_lofi(self):
+        self.assertEqual(
+            styles.scaffold_custom_prompt("lofi beats to relax to"),
+            "lofi beats to relax to",
+        )
+        self.assertIsNone(styles.scaffold_custom_prompt("   "))
+        self.assertIsNone(styles.scaffold_custom_prompt(None))
+
+    def test_free_text_prompt_is_length_capped(self):
+        long_text = "piano " * 60
+        controls = MusicControls.initial().update({"customPrompt": long_text})
+        self.assertLessEqual(
+            len(controls.customPrompt), styles.MAX_CUSTOM_PROMPT_CHARS
+        )
+
+    def test_named_station_clears_stale_custom_prompt(self):
+        controls = MusicControls.initial().update({"customPrompt": "spacey pads"})
+        self.assertEqual(controls.station, "custom")
+        controls = controls.update({"station": "jazz-cafe"})
+        self.assertEqual(controls.station, "jazz-cafe")
+        self.assertEqual(controls.customPrompt, "")
+        self.assertEqual(controls.prompt(), styles.STATIONS["jazz-cafe"].prompt)
+
+    def test_granular_dials_clamp_and_default_to_neutral(self):
+        controls = MusicControls.initial()
+        self.assertEqual(controls.adherence, 0.5)
+        self.assertEqual(controls.variation, 0.5)
+        controls = controls.update({"adherence": 9, "variation": -3})
+        self.assertEqual(controls.adherence, 1.0)
+        self.assertEqual(controls.variation, 0.0)
+
+    def test_sampling_overrides_are_monotonic_and_centered(self):
+        neutral = MusicControls.initial().sampling_overrides()
+        self.assertAlmostEqual(neutral["cfg_musiccoca_scale"], 1.075, places=3)
+        low = MusicControls.initial().update({"adherence": 0.0}).sampling_overrides()
+        high = MusicControls.initial().update({"adherence": 1.0}).sampling_overrides()
+        self.assertLess(low["cfg_musiccoca_scale"], high["cfg_musiccoca_scale"])
+        calm = MusicControls.initial().update({"variation": 0.0}).sampling_overrides()
+        wild = MusicControls.initial().update({"variation": 1.0}).sampling_overrides()
+        self.assertLess(calm["temperature_scale"], wild["temperature_scale"])
 
 
 if __name__ == "__main__":

@@ -46,6 +46,9 @@ CONTROL_FIELDS = (
     "intensity",
     "melody",
     "drums",
+    "customPrompt",
+    "adherence",
+    "variation",
 )
 
 

@@ -14,6 +14,14 @@ import { useRadio } from "@/components/radio-provider"
 import { applyDesignAppearance, DESIGNS, DESIGN_TONES, type NewDesign, type DesignTone } from "@/lib/designs"
 import type { ListenerControls } from "@/lib/mrt-stream"
 
+// The alternate designs present only the named stations. A listener can pick
+// the custom prompt on the original interface and then open a design via an
+// in-app link, so resolve to the first named station rather than crashing on
+// a station id ("custom") these tiled designs do not list.
+function namedStation(stationId: string) {
+  return STATION_PRESETS.find((entry) => entry.id === stationId) ?? STATION_PRESETS[0]
+}
+
 interface Preferences {
   tone: DesignTone
   companion: boolean
@@ -117,7 +125,7 @@ function ScenePresets() {
   return (
     <div className="scene-presets" role="group" aria-label="Listening presets">
       {PRESETS.map((preset, index) => (
-        <button key={preset.name} type="button" title={preset.description} aria-pressed={controls.station === preset.station && controls.drums === preset.drums} onClick={() => { setControls({ station: preset.station, drums: preset.drums }); setVolume(preset.volume) }}>
+        <button key={preset.name} type="button" title={preset.description} aria-pressed={controls.station === preset.station && controls.drums === preset.drums} onClick={() => { setControls({ ...controls, station: preset.station, drums: preset.drums, customPrompt: "" }); setVolume(preset.volume) }}>
           <span className="preset-mark" aria-hidden="true">{["◒", "≈", "✳"][index]}</span>{preset.name}
         </button>
       ))}
@@ -185,7 +193,7 @@ function DesignHeader({ design, openSettings, openWorkspace }: { design: NewDesi
 
 function Sunday({ preferences }: { preferences: Preferences }) {
   const { controls } = useRadio()
-  const station = STATION_PRESETS.find((entry) => entry.id === controls.station)!
+  const station = namedStation(controls.station)
   return (
     <>
       <div className="sunday-heading">
@@ -215,7 +223,7 @@ function Sunday({ preferences }: { preferences: Preferences }) {
 
 function Form({ preferences }: { preferences: Preferences }) {
   const { controls } = useRadio()
-  const station = STATION_PRESETS.find((entry) => entry.id === controls.station)!
+  const station = namedStation(controls.station)
   return (
     <div className="form-shell">
       <aside className="form-sidebar">
@@ -244,7 +252,7 @@ function Form({ preferences }: { preferences: Preferences }) {
 
 function Signal({ preferences }: { preferences: Preferences }) {
   const { controls, isLive } = useRadio()
-  const stationIndex = STATION_PRESETS.findIndex((entry) => entry.id === controls.station)
+  const stationIndex = Math.max(0, STATION_PRESETS.findIndex((entry) => entry.id === controls.station))
   const station = STATION_PRESETS[stationIndex]
   return (
     <>

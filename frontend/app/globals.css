@@ -362,8 +362,16 @@
   .site-shell {
     position: relative;
     min-height: 100vh;
+    min-height: 100dvh;
+    /* Fit the whole experience in one viewport on a laptop: the shell is a
+       flex column and the frame consumes the height that remains after the
+       toolbar. It still scrolls on short/mobile viewports via the media
+       queries below, which relax the fixed height. */
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
     overflow: hidden;
-    padding: clamp(1rem, 3vw, 2.6rem);
+    padding: clamp(0.75rem, 2.2vw, 1.75rem);
     isolation: isolate;
   }
 
@@ -470,6 +478,10 @@
   .app-frame {
     position: relative;
     z-index: 1;
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
+    flex-direction: column;
     width: min(100%, 76rem);
     margin: 0 auto;
   }
@@ -478,22 +490,26 @@
     display: flex;
     position: relative;
     z-index: 5;
+    flex: 0 0 auto;
     justify-content: flex-end;
-    margin-bottom: 1rem;
+    margin-bottom: 0.6rem;
   }
 
   .workspace-grid {
     display: grid;
+    flex: 1 1 auto;
+    min-height: 0;
     grid-template-columns: minmax(0, 1.12fr) minmax(21rem, 0.88fr);
-    align-items: start;
-    gap: clamp(1rem, 2vw, 1.35rem);
+    align-items: stretch;
+    gap: clamp(0.85rem, 1.6vw, 1.25rem);
   }
 
   .side-stack {
     display: flex;
     min-width: 0;
+    min-height: 0;
     flex-direction: column;
-    gap: clamp(1rem, 2vw, 1.35rem);
+    gap: clamp(0.85rem, 1.6vw, 1.25rem);
   }
 
   .surface-card {
@@ -527,31 +543,44 @@
   }
 
   .music-card {
-    min-height: 45rem;
-    padding: clamp(1.25rem, 3vw, 2rem);
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+    padding: clamp(1rem, 2.4vw, 1.75rem);
   }
 
   .tasks-card,
   .timer-card {
-    padding: clamp(1rem, 2vw, 1.35rem);
+    padding: clamp(0.85rem, 1.8vw, 1.25rem);
   }
 
   .tasks-card {
     display: flex;
-    min-height: 16rem;
+    min-height: 0;
+    flex: 1 1 auto;
     flex-direction: column;
+  }
+
+  .timer-card {
+    flex: 0 0 auto;
+  }
+
+  .companion-card {
+    flex: 0 0 auto;
   }
 
   .card-intro {
     display: flex;
+    flex: 0 0 auto;
     align-items: flex-end;
     justify-content: space-between;
     gap: 1.5rem;
+    margin-bottom: 0.35rem;
   }
 
   .card-intro h1 {
-    margin: 0.35rem 0 0;
-    font-size: clamp(1.85rem, 4vw, 3rem);
+    margin: 0.25rem 0 0;
+    font-size: clamp(1.6rem, 3.2vw, 2.5rem);
     font-weight: 560;
     line-height: 1;
     letter-spacing: -0.045em;
@@ -899,13 +928,13 @@
 
   .music-control-layout {
     display: flex;
-    height: calc(100% - 4.5rem);
-    min-height: 38rem;
+    flex: 1 1 auto;
+    min-height: 0;
     flex-direction: column;
     align-items: center;
     justify-content: space-between;
-    gap: 1.4rem;
-    padding-top: 0.75rem;
+    gap: clamp(0.9rem, 1.8vw, 1.4rem);
+    padding-top: 0.5rem;
   }
 
   .visualizer-stage {
@@ -983,12 +1012,77 @@
   .control-bank {
     display: grid;
     width: min(100%, 25rem);
-    gap: 1.25rem;
-    padding: 1.15rem 1.2rem;
+    gap: clamp(0.7rem, 1.4vw, 1.1rem);
+    padding: clamp(0.85rem, 1.6vw, 1.15rem) clamp(0.9rem, 1.6vw, 1.2rem);
     border: 1px solid var(--line-color);
     border-radius: 1.35rem;
     background: color-mix(in srgb, var(--surface-strong) 76%, transparent);
     box-shadow: var(--shadow-soft);
+  }
+
+  .control-select {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--line-color);
+    border-radius: 0.6rem;
+    background: transparent;
+    color: var(--text);
+    font-size: 0.875rem;
+  }
+
+  .control-dials {
+    display: grid;
+    gap: clamp(0.6rem, 1.2vw, 0.9rem);
+  }
+
+  .control-prompt {
+    margin-top: 0.65rem;
+    display: grid;
+    gap: 0.5rem;
+  }
+
+  .control-prompt-input {
+    width: 100%;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--line-color);
+    border-radius: 0.6rem;
+    background: color-mix(in srgb, var(--surface-strong) 60%, transparent);
+    color: var(--text);
+    font-size: 0.85rem;
+  }
+
+  .control-prompt-input::placeholder {
+    color: var(--text-faint);
+  }
+
+  .control-prompt-input:focus-visible {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 60%, var(--line-color));
+    box-shadow: 0 0 0 0.18rem color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  .control-prompt-suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .prompt-chip {
+    padding: 0.28rem 0.6rem;
+    border: 1px solid var(--line-color);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 0.68rem;
+    line-height: 1.2;
+    cursor: pointer;
+    transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+  }
+
+  .prompt-chip:hover {
+    color: var(--text);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--line-color));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
 
   .flow-range-shell {
@@ -1206,12 +1300,24 @@
 }
 
 @media (max-width: 960px) {
+  /* Stacked layout no longer fits one viewport; let the page scroll again. */
+  .site-shell {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
   .workspace-grid {
     grid-template-columns: 1fr;
+    flex: 0 1 auto;
   }
 
   .music-card {
     min-height: 43rem;
+  }
+
+  .music-control-layout {
+    min-height: 34rem;
   }
 
   .side-stack {

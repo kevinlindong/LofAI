@@ -109,6 +109,33 @@ class SessionControlTests(unittest.TestCase):
         self.assertTrue(all(run.drum == 0 for run in plan))
         self.assertEqual(session.control_payload()["bpm"], 96)
 
+    def test_free_text_prompt_reaches_the_style_plan(self):
+        session = Session("prompt", "neutral", "guitar", station="dusty-beats")
+        engine = PlanEngine()
+        session.conditioning_plan(engine, 10)
+        session.request_controls({"customPrompt": "rainy tokyo saxophone"})
+
+        plan = session.conditioning_plan(engine, 200)
+        self.assertEqual(session.station, "custom")
+        self.assertIn("rainy tokyo saxophone", session._active_prompt)
+        self.assertTrue(session._active_prompt.startswith("instrumental lo-fi"))
+        # The landed style run carries the scaffolded prompt as its cache key.
+        self.assertIn("rainy tokyo saxophone", plan[-1].key)
+
+    def test_granular_dials_change_the_run_sampling(self):
+        session = Session("dials", "neutral", "guitar", station="dusty-beats")
+        engine = PlanEngine()
+        baseline = session.conditioning_plan(engine, 10)[0].sampling
+        session.request_controls({"adherence": 1.0, "variation": 1.0})
+        steered = session.conditioning_plan(engine, 10)[0].sampling
+
+        # More adherence raises MusicCoCa guidance; more variation raises
+        # temperature. Both stay within the safe clamps.
+        self.assertGreater(steered.cfg_musiccoca, baseline.cfg_musiccoca)
+        self.assertGreater(steered.temperature, baseline.temperature)
+        self.assertLessEqual(steered.cfg_musiccoca, 6.0)
+        self.assertLessEqual(steered.temperature, 1.3)
+
     def test_returning_to_active_style_cancels_pending_bar_change(self):
         session = Session("cancel-style", "neutral", "guitar")
         engine = PlanEngine()

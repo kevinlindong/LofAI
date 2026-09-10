@@ -166,7 +166,20 @@ class MRTEngine:
         # when actual notes are supplied (the evaluation harness may do so).
         self.temperature = _env_float("MRT_TEMPERATURE", 1.0)
         self.top_k = _env_int("MRT_TOP_K", 100)
-        self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 3.0)
+        # MusicCoCa guidance is the strongest lever on long-take stability. At
+        # the library's live default of 3.0, sparse stations (rainy-piano, no
+        # drums) reliably drifted into a self-fed hiss bed: the quiet-gap
+        # 5-20 kHz floor climbed from ~-70 dBFS to -33 to -42 dBFS within 4-8
+        # minutes across every seed measured, with up to half the quiet-block
+        # energy above 5 kHz - audible static that grows until it buries the
+        # music. Raising the scale to 4.0 holds the model to the station's
+        # timbre instead: the same seeds peaked near -60 dBFS and receded to
+        # -74 dBFS rather than running away, and hiss share stayed under ~6%.
+        # Busy stations (dusty-beats, jazz-cafe) were unchanged - already
+        # stable at 3.0, still stable at 4.0. CFG is encoded as conditioning
+        # tokens here, so a higher scale costs no throughput. The take guard
+        # remains the backstop for the takes that still drift.
+        self.cfg_musiccoca = _env_float("MRT_CFG_MUSICCOCA", 4.0)
         self.cfg_notes = _env_float("MRT_CFG_NOTES", 1.0)
         self.cfg_drums = _env_float("MRT_CFG_DRUMS", 1.0)
 

@@ -26,6 +26,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 # How long a station change takes to fully land. The stream glides to the new
 # style over this window and then sits exactly on it.
 STYLE_RAMP_SECONDS = max(
@@ -436,7 +440,7 @@ class Session:
         style_runs = self.style_plan(engine, frames)
         with self._lock:
             controls = self.controls
-        sampling = self._sampling_for(engine)
+        sampling = self._sampling_for(engine, controls)
         drum = None if controls.drums else 0
         return [
             engine_mod.ConditioningRun(
@@ -451,11 +455,31 @@ class Session:
         ]
 
     @staticmethod
-    def _sampling_for(engine) -> engine_mod.SamplingControls:
-        return (
+    def _sampling_for(engine, controls=None) -> engine_mod.SamplingControls:
+        base = (
             engine.default_sampling()
             if hasattr(engine, "default_sampling")
             else engine_mod.SamplingControls(1.0, 100, 3.0, 1.0, 1.0)
+        )
+        if controls is None:
+            return base
+        overrides = controls.sampling_overrides()
+        # Clamp the derived values to ranges the model tolerates for live,
+        # long-running takes. These bounds bracket the tuned production
+        # defaults (temperature 1.0, MusicCoCa CFG 4.0) without letting a
+        # listener push the stream somewhere it drifts or collapses.
+        temperature = _clamp(
+            base.temperature * overrides["temperature_scale"], 0.7, 1.3
+        )
+        cfg_musiccoca = _clamp(
+            base.cfg_musiccoca * overrides["cfg_musiccoca_scale"], 3.0, 6.0
+        )
+        return engine_mod.SamplingControls(
+            temperature=temperature,
+            top_k=base.top_k,
+            cfg_musiccoca=cfg_musiccoca,
+            cfg_notes=base.cfg_notes,
+            cfg_drums=base.cfg_drums,
         )
 
     def _ramp_at(self, elapsed: float) -> tuple[np.ndarray, str | None]:
