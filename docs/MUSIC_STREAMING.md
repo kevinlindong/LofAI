@@ -389,24 +389,62 @@ half a minute looks like, and it recovers on its own.
 
 `backend/take_health.py` watches exactly this measurement on the PCM each
 listener actually receives. A baseline floor profile is frozen over the
-take's first minute (after a short landing period); the high band (5-14
-kHz) of the trailing minute's floor must then rise at least 10 dB over its
-own baseline and clear an absolute audibility gate, in at least 80% of
-evaluations across a 40-second audio window, before the take is declared
-drifted. The decision is deliberately spectral: a live-captured failure
-grew +22 dB of high-band hiss while its overall floor rose only +1 dB -
-the bed brightens long before it lifts - while a warm rumble or denser
-bass never qualifies. Level and spectrum are measured on the same
-quietest-decile blocks, so louder or denser playing does not qualify
-either - only the bed under it. The repair is a server-side equal-power
-crossfade onto a fresh recurrent state under the same conditioning (one
-extra chunk of render cost, deterministic refresh seed, no transport or
-session change): a subtle track change instead of a slowly degrading
-stream. Replayed against the captured takes, the guard fires mid-runaway
-on both failures, twice on the worst, never on the healthy 6-minute take,
-and costs one borderline cymbal-wash passage a single crossfade. Station
-changes re-learn the baseline, since the recurrent state - and any drift
-it carries - survives them. `MRT_TAKE_GUARD=0` disables the guard.
+take's first 40 seconds (after a 10-second landing period); the high band
+(5-20 kHz) of the trailing 30 seconds' floor must then rise at least 10 dB
+over its own baseline and reach -60 dBFS, in at least 80% of evaluations
+across a 30-second audio window, before the take is declared drifted. A
+second, baseline-free test declares drift when that floor reaches -38 dBFS
+outright, so a take whose baseline was itself learned from hiss still gets
+cut. The decision is deliberately spectral: a live-captured failure grew
++22 dB of high-band hiss while its overall floor rose only +1 dB - the bed
+brightens long before it lifts - while a warm rumble or denser bass never
+qualifies. Level and spectrum are measured on the same quietest-decile
+blocks, so louder or denser playing does not qualify either - only the bed
+under it. The repair is a server-side equal-power crossfade onto a fresh
+recurrent state under the same conditioning (one extra chunk of render
+cost, deterministic refresh seed, no transport or session change): a subtle
+track change instead of a slowly degrading stream. Station changes re-learn
+the baseline, since the recurrent state - and any drift it carries -
+survives them; if the floor was already voting for drift when the station
+changed, the worker splices onto a fresh state at that boundary rather than
+letting the next station learn the hiss as its normal. `MRT_TAKE_GUARD=0`
+disables the guard.
+
+A later re-measurement found the first calibration too cautious to help.
+Nine takes of 4-10 minutes were rendered offline through the live engine
+path (`ChunkRenderer`, compiled step, batched codec, 12 codebooks) and
+replayed through the monitor:
+
+| Take | 5-20 kHz quiet-block floor, start → worst | first guard fire |
+|---|---:|---:|
+| rainy-piano, drums (seed 1234) | -69 → -55 dBFS at 2.6 min | 2.7 min |
+| rainy-piano, drums, `MRT_COMPILE=0` | -68 → -50 dBFS at 2.9 min | 2.2 min |
+| rainy-piano, no drums (seed 777) | -69 → -50 dBFS at 4.2 min | 4.2 min |
+| rainy-piano, no drums, `MRT_TEMPERATURE=0.9` | -72 → -37 dBFS at 9.4 min | 3.0 min |
+| rainy-piano, no drums, `MRT_BITS=0` | -70 → -55 dBFS at 8.8 min | 8.8 min |
+| dusty-beats, drums | -67 → -41 dBFS at 6.8 min | 5.1 min |
+| jazz-cafe, drums (seed 99) | -54 → -40 dBFS at 7.0 min | 5.5 min |
+| jazz-cafe, drums (seed 4242) | -54 → -44 dBFS, receded | never |
+| sunlit-groove, drums | -51 → -45 dBFS, receded | never |
+
+Every configuration drifted, so the habit belongs to the model rather than
+to compilation, batching, quantisation, or the sampling temperature. Two
+textures appeared. Sparse stations grew broadband 3-13 kHz hiss in their
+gaps, with a persistent tone near 5 kHz on the way. Busy stations grew a
+14-20 kHz bed under the music: the dusty-beats take's stationary 14-20 kHz
+level climbed monotonically from -87 to -41 dBFS over six minutes while its
+5-10 kHz band never moved, which the earlier 5-14 kHz band could not see at
+all. Under the earlier constants (60-second baseline and trailing windows,
+40-second sustain, -52 dBFS audibility gate, 5-14 kHz) the seed-777 take
+never fired in ten minutes: its floor sat at -55 to -60 dBFS - audible
+hiss after the client's +5 dB makeup - for four minutes below the gate. The
+worst take reached -35 dBFS with two thirds of its quiet-block energy above
+5 kHz, which is the "static that gets louder until the music is
+unlistenable" listeners reported. The current constants fire on all seven
+runaways between 2.2 and 5.5 minutes (8.8 for the full-precision take,
+whose drift began late) and on neither healthy take; the closest healthy
+excursion, a brushed passage on jazz-cafe, reached +9.8 dB over its
+baseline for about a minute.
 
 The September audit found that folding PCM to mono before measuring it hid
 opposite-phase stereo hiss. The monitor now averages channel powers instead,

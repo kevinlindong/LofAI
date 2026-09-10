@@ -103,14 +103,104 @@ class TakeFloorMonitorTests(unittest.TestCase):
         rng = np.random.default_rng(5)
         monitor = TakeFloorMonitor()
         clean = np.concatenate(
-            [_music_second(rng, -75.0, gap_hiss=True) for _ in range(140)]
+            [_music_second(rng, -85.0, gap_hiss=True) for _ in range(140)]
         )
         _feed_seconds(monitor, clean)
         quiet_rise = np.concatenate(
-            [_music_second(rng, -55.0, gap_hiss=True) for _ in range(80)]
+            [_music_second(rng, -68.0, gap_hiss=True) for _ in range(80)]
         )
         _feed_seconds(monitor, quiet_rise)
         self.assertFalse(monitor.drifted, "a rise below audibility is not worth a cut")
+
+    def test_quiet_but_audible_hiss_is_still_drift(self):
+        # A captured live take sat at this level for ten minutes: -55 dBFS of
+        # broadband gap hiss is plainly audible once the browser adds makeup.
+        rng = np.random.default_rng(5)
+        monitor = TakeFloorMonitor()
+        clean = np.concatenate(
+            [_music_second(rng, -75.0, gap_hiss=True) for _ in range(140)]
+        )
+        _feed_seconds(monitor, clean)
+        self.assertFalse(monitor.drifted)
+        quiet_hiss = np.concatenate(
+            [_music_second(rng, -55.0, gap_hiss=True) for _ in range(80)]
+        )
+        _feed_seconds(monitor, quiet_hiss)
+        self.assertTrue(monitor.drifted)
+
+    def test_runaway_floor_fires_without_a_baseline_rise(self):
+        # A station change carries the recurrent state, and its drift, into a
+        # freshly learned baseline. A floor this loud is hiss whatever the
+        # take began as, so the absolute threshold must not need the rise.
+        rng = np.random.default_rng(3)
+        monitor = TakeFloorMonitor()
+        already_hissy = np.concatenate(
+            [_music_second(rng, -40.0, gap_hiss=True) for _ in range(140)]
+        )
+        _feed_seconds(monitor, already_hissy)
+        self.assertFalse(monitor.drifted)
+        louder = np.concatenate(
+            [_music_second(rng, -34.0, gap_hiss=True) for _ in range(80)]
+        )
+        _feed_seconds(monitor, louder)
+        self.assertLess(
+            take_health._dbfs(
+                take_health._floor_profile(
+                    monitor._trailing_rms, monitor._trailing_high
+                )[1]
+            )
+            - take_health._dbfs(monitor._baseline_high_floor),
+            take_health.HIGH_BAND_RISE_DB,
+            "the test must exercise the absolute threshold, not the rise",
+        )
+        self.assertTrue(monitor.drifted)
+
+    def test_runaway_floor_can_vote_before_the_baseline_exists(self):
+        rng = np.random.default_rng(4)
+        monitor = TakeFloorMonitor()
+        for second in range(48):
+            _feed_seconds(monitor, _music_second(rng, -30.0, gap_hiss=True))
+        self.assertIsNone(monitor._baseline_floor)
+        self.assertTrue(monitor.suspicious, "the absolute test needs no baseline")
+        self.assertIn("no baseline yet", monitor.describe())
+        for second in range(24):
+            _feed_seconds(monitor, _music_second(rng, -30.0, gap_hiss=True))
+        self.assertTrue(monitor.drifted)
+
+    def test_very_high_band_bed_is_detected(self):
+        # The second measured runaway texture: a 14-20 kHz bed that grows
+        # under busy music while nothing below 14 kHz changes.
+        rng = np.random.default_rng(21)
+        monitor = TakeFloorMonitor()
+        gap_len = int(0.2 * RATE)
+        freqs = np.fft.rfftfreq(gap_len, 1.0 / RATE)
+        band = (freqs >= 14_000) & (freqs <= 20_000)
+
+        def bed(level_db: float) -> np.ndarray:
+            noise = np.fft.rfft(rng.normal(0.0, 1.0, gap_len))
+            shaped = np.fft.irfft(np.where(band, noise, 0.0), n=gap_len)
+            shaped /= np.sqrt(np.mean(shaped**2)) + 1e-12
+            return shaped * 10 ** (level_db / 20)
+
+        for second in range(230):
+            audio = _music_second(rng, -70.0, gap_hiss=False)
+            level = -80.0 if second < 140 else -45.0
+            audio[-gap_len:] += bed(level)
+            _feed_seconds(monitor, audio)
+            if second == 139:
+                self.assertFalse(monitor.drifted)
+        self.assertTrue(monitor.drifted)
+
+    def test_suspicious_reports_the_latest_vote_before_sustain(self):
+        rng = np.random.default_rng(11)
+        monitor = TakeFloorMonitor()
+        for second in range(140):
+            _feed_seconds(monitor, _music_second(rng, -50.0, gap_hiss=True))
+        self.assertFalse(monitor.suspicious)
+        for second in range(30):
+            _feed_seconds(monitor, _music_second(rng, -28.0, gap_hiss=True))
+        self.assertTrue(monitor.suspicious, "the floor has begun to rise")
+        self.assertFalse(monitor.drifted, "but not for long enough to cut")
 
     def test_observe_tolerates_junk_chunks(self):
         monitor = TakeFloorMonitor()
@@ -155,7 +245,7 @@ class TakeFloorMonitorTests(unittest.TestCase):
     def test_empty_chunks_do_not_turn_a_brief_rise_into_sustained_drift(self):
         rng = np.random.default_rng(11)
         monitor = TakeFloorMonitor()
-        for second in range(200):
+        for second in range(170):
             _feed_seconds(
                 monitor,
                 _music_second(rng, -50.0 if second < 140 else -28.0, gap_hiss=True),
@@ -239,6 +329,26 @@ class SessionIntegrationTests(unittest.TestCase):
         session.request_controls({"station": "rainy-piano"})
         session.conditioning_plan(self.PlanEngine(), 10)
         self.assertIsNone(session.floor_monitor._baseline_floor)
+        self.assertFalse(session.consume_refresh_request())
+
+    def test_station_change_on_a_rising_floor_requests_a_fresh_state(self):
+        session = Session("floor-carry", "neutral", "guitar")
+        session.floor_monitor._drift_votes.append(True)
+        self.assertTrue(session.floor_monitor.suspicious)
+        session.request_controls({"station": "rainy-piano"})
+        session.conditioning_plan(self.PlanEngine(), 10)
+        self.assertFalse(session.floor_monitor.suspicious, "the monitor was reset")
+        self.assertTrue(session.consume_refresh_request())
+        self.assertFalse(session.consume_refresh_request(), "consumed once")
+
+    def test_new_take_supersedes_a_pending_refresh(self):
+        session = Session("floor-super", "neutral", "guitar")
+        session.floor_monitor._drift_votes.append(True)
+        session.request_controls({"station": "rainy-piano"})
+        session.conditioning_plan(self.PlanEngine(), 10)
+        session.request_transport_reset()
+        session.prepare_render()
+        self.assertFalse(session.consume_refresh_request())
 
     def test_refresh_seeds_are_stable_and_distinct(self):
         session = Session("floor-seeds", "neutral", "guitar")
@@ -394,6 +504,62 @@ class WorkerRepairTests(unittest.TestCase):
             self.assertEqual(session.seed, fresh_calls[1][1])
             self.assertNotEqual(session.seed, original_seed)
             self.assertEqual(session.refreshes, 1)
+        finally:
+            manager.stop()
+
+    class QuietMonitor(StubMonitor):
+        """Never sustains drift, but reports a rising floor once."""
+
+        def observe(self, _pcm):
+            pass
+
+        @property
+        def suspicious(self):
+            return self._armed
+
+    def test_station_change_on_a_rising_floor_is_crossfaded_onto_a_fresh_state(self):
+        import threading
+        import session_manager as manager_mod
+
+        manager = manager_mod.SessionManager()
+        engine = self.RefreshEngine()
+        manager.engine = engine
+        delivered = []
+        got_pcm = threading.Event()
+
+        def epoch_sink(pcm, _epoch):
+            delivered.append(pcm)
+            got_pcm.set()
+
+        manager.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while not engine.ready and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(engine.ready)
+
+            session, _ = manager.attach(
+                None, "neutral", "guitar", epoch_sink=epoch_sink
+            )
+            stub = self.QuietMonitor()
+            session.floor_monitor = stub
+            # The listener changes station while the floor is voting for
+            # drift; the worker applies the change on its next chunk.
+            session.request_controls({"station": "rainy-piano"})
+            engine.gate.set()
+
+            self.assertTrue(got_pcm.wait(5.0))
+            deadline = time.monotonic() + 5.0
+            while stub.resets < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            # once by the station change, once by the splice itself
+            self.assertEqual(stub.resets, 2)
+            self.assertEqual(
+                delivered[0], crossfade_pcm(engine.OLD, engine.FRESH)
+            )
+            self.assertEqual(session.refreshes, 1)
+            self.assertFalse(session.consume_refresh_request())
         finally:
             manager.stop()
 

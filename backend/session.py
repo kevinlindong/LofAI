@@ -136,6 +136,11 @@ class Session:
         # onto a fresh state without touching the session or transport.
         self.floor_monitor = TakeFloorMonitor()
         self._refreshes = 0
+        # Set when a station change arrives while the floor is already voting
+        # for drift: the new station should not inherit a state that has
+        # begun to hiss. The worker performs the same crossfade it uses for a
+        # sustained drift, at a moment that is already a musical boundary.
+        self._refresh_requested = False
 
         # Set by the websocket handler while a client is attached. The worker
         # supplies ``(pcm, render_epoch)`` so deferred event-loop delivery can
@@ -224,6 +229,7 @@ class Session:
                 self._ramp_elapsed = 0.0
                 self._ramping = False
                 self._reset_requested = False
+                self._refresh_requested = False
                 self.floor_monitor.reset()
             return self._render_epoch
 
@@ -236,6 +242,13 @@ class Session:
     @property
     def refreshes(self) -> int:
         return self._refreshes
+
+    def consume_refresh_request(self) -> bool:
+        """Return and clear a pending mid-take state refresh request."""
+        with self._lock:
+            requested = self._refresh_requested
+            self._refresh_requested = False
+            return requested
 
     def render_is_current(self, epoch: int) -> bool:
         with self._lock:
@@ -347,6 +360,11 @@ class Session:
             # The recurrent state - and any drift it carries - survives a
             # station change, but the new station's own gap floor is a new
             # normal. Re-learn the baseline rather than comparing stations.
+            # If the floor was already voting for drift, do not let the next
+            # station learn that hiss as its baseline: have the worker splice
+            # onto a fresh state at this boundary instead.
+            if self.floor_monitor.suspicious:
+                self._refresh_requested = True
             self.floor_monitor.reset()
             if self._current is not None:
                 # ramp from wherever we are now, which may itself be mid-ramp

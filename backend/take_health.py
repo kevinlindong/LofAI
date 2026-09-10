@@ -1,14 +1,27 @@
 """Detecting and repairing a take whose noise floor drifts upward.
 
 MRT2 continues its own recurrent audio: whatever it just played is the
-context for what it plays next. On sparse stations that feedback has a
-failure attractor - once a bright sustained texture (tape hiss, cymbal wash)
-enters the roughly 20-second context window, the model tends to continue and
-amplify it. Measured on a 12-minute rainy-piano take, the level of the
-quietest 50 ms blocks rose from -42.7 to -32.6 dBFS while their 6-12 kHz
-energy share grew from 3% to 19%: a hiss bed that was not there at the
-start. Busier stations (dusty-beats) held a stable floor for the same
-duration, so this is a per-take failure, not a constant.
+context for what it plays next. That feedback has a failure attractor - once
+a bright sustained texture (tape hiss, cymbal wash) enters the roughly
+20-second context window, the model tends to continue and amplify it. It
+takes two measured forms:
+
+- On sparse stations, broadband 3-13 kHz hiss grows in the gaps between
+  notes. On 10-minute rainy-piano takes rendered with the live
+  configuration, the 5-20 kHz level of the quietest 50 ms blocks starts near
+  -70 dBFS, typically reaches -60 dBFS by 2-3 minutes and -50 dBFS by four;
+  one take ran away to -35 dBFS with two thirds of its quiet-block energy
+  above 5 kHz - a whistle-and-static texture that buries the music.
+- On busy stations, a 14-20 kHz bed grows steadily under the music. A
+  dusty-beats take's stationary 14-20 kHz level climbed monotonically from
+  -87 dBFS to -41 dBFS over six minutes while its 5-10 kHz band did not
+  move; a jazz-cafe take rose 29 dB in that band inside two minutes. A
+  detector that stopped at 14 kHz never saw either.
+
+The drift is present with and without ``mx.compile``, at eight-bit and at
+full precision, and at temperature 0.9, so it is the model's habit rather
+than an artefact of this pipeline; it is per-take, not constant, and some
+takes recede on their own.
 
 ``TakeFloorMonitor`` watches the stream the listener actually receives. It
 profiles the quietest blocks - the gaps between notes, where a hiss bed is
@@ -17,6 +30,20 @@ window. Its high-band level must become audibly louder and stay there before
 it reports drift. The overall floor is diagnostic: a bed can brighten well
 before its total level changes. Stereo power is measured before combining
 channels, so wide or opposite-phase noise cannot disappear in a mono fold.
+
+Two thresholds gate a drift vote. The relative one needs the high band of
+the floor to rise ``HIGH_BAND_RISE_DB`` over the take's own baseline and to
+be loud enough to hear; an earlier -52 dBFS audibility gate let a captured
+take sit at -55 to -60 dBFS - plainly audible hiss after the browser's +5 dB
+makeup - for ten minutes without a single vote. The absolute one,
+``RUNAWAY_HIGH_DBFS``, needs no baseline at all: a floor that loud is hiss on
+every station, and it is the only defence when the baseline itself was
+learned from an already-drifting take (a station change carries the
+recurrent state, and its drift, into a fresh baseline). Replayed against
+nine captured takes, the current constants fire on every runaway between
+2.2 and 5.5 minutes (the full-precision take at 8.8, when its drift finally
+began) and never on the two healthy busy takes.
+
 The repair is a server-side equal-power crossfade onto a fresh
 recurrent state (same station, new seed), which reads as a radio track
 change rather than a dropout: PCM flow, session identity, and the client
@@ -40,10 +67,12 @@ BLOCK_FRAMES = int(SAMPLE_RATE * BLOCK_SECONDS)
 FLOOR_PERCENTILE = 10.0
 
 # Skip the first seconds of a take (transport start, style landing), then
-# freeze a baseline over the following stretch.
+# freeze a baseline over the following stretch. The trailing window fills
+# from the end of the skip, so the absolute test below can vote before the
+# baseline exists.
 BASELINE_SKIP_SECONDS = 10.0
-BASELINE_SECONDS = 60.0
-TRAILING_SECONDS = 60.0
+BASELINE_SECONDS = 40.0
+TRAILING_SECONDS = 30.0
 
 # A hiss bed is, concretely, high-frequency noise in the quietest blocks
 # that was not there at the start of the take. The high band of the floor
@@ -52,22 +81,36 @@ TRAILING_SECONDS = 60.0
 # reported for observability but deliberately not required: a captured live
 # failure grew +22 dB of high-band hiss while its overall floor rose only
 # +1 dB (the bed brightened long before it lifted), and healthy takes'
-# high-band floors wander far less. Measured runaways rose +17 to +28 dB in
-# band and stayed; the strongest healthy excursion (brushed-cymbal wash)
-# briefly reached +17 dB and receded within a window.
+# high-band floors wander far less. Measured runaways rose +14 to +26 dB in
+# band and kept rising; the strongest healthy excursion (a brushed-cymbal
+# passage on jazz-cafe) reached +10 dB and receded within a window.
+#
+# Healthy rainy-piano takes keep this band near -70 dBFS in their gaps, so a
+# ten-decibel rise lands around -60 dBFS; the browser adds 5 dB of makeup
+# before the listener hears it. Anything at or above -60 dBFS here is
+# audible hiss between notes.
 HIGH_BAND_RISE_DB = 10.0
-MIN_AUDIBLE_HIGH_DBFS = -52.0
+MIN_AUDIBLE_HIGH_DBFS = -60.0
+# A floor this bright is a runaway regardless of what the take started from.
+# Healthy busy stations (brushed and crisp drums in the quietest blocks)
+# were measured no higher than -44 dBFS over a trailing window; the captured
+# runaway sat at -33 to -37 dBFS for over a minute.
+RUNAWAY_HIGH_DBFS = -38.0
 # Drift must hold in most evaluations across this audio-time window. A fraction
 # over a window, not a consecutive streak: one quiet evaluation must not
 # reset the clock on a take that has been hissing for a minute. Measuring
 # generated audio time also keeps this independent of chunk size, transport
 # fragmentation, pauses, or repeated empty input.
 EVALUATION_SECONDS = 0.4
-SUSTAIN_SECONDS = 40.0
+SUSTAIN_SECONDS = 30.0
 SUSTAIN_FRACTION = 0.8
 
+# Both measured runaway textures live above 5 kHz: the sparse-station hiss
+# spans 3-13 kHz and the busy-station bed 14-20 kHz. Starting lower than
+# 5 kHz reads brushed snares and guitar harmonics as hiss on jazz-cafe;
+# stopping at 14 kHz misses the second texture entirely.
 HIGH_BAND_LOW_HZ = 5_000.0
-HIGH_BAND_HIGH_HZ = 14_000.0
+HIGH_BAND_HIGH_HZ = 20_000.0
 
 _EPS = 1e-12
 
@@ -154,34 +197,34 @@ class TakeFloorMonitor:
         seconds = self._seen_blocks * BLOCK_SECONDS
         if seconds <= BASELINE_SKIP_SECONDS:
             return
-        if seconds <= BASELINE_SKIP_SECONDS + BASELINE_SECONDS:
-            self._baseline_rms.append(rms)
-            self._baseline_high.append(high)
-            return
         if self._baseline_floor is None:
-            self._baseline_floor, self._baseline_high_floor = _floor_profile(
-                self._baseline_rms, self._baseline_high
-            )
-            self._baseline_rms = []
-            self._baseline_high = []
+            if seconds <= BASELINE_SKIP_SECONDS + BASELINE_SECONDS:
+                self._baseline_rms.append(rms)
+                self._baseline_high.append(high)
+            else:
+                self._baseline_floor, self._baseline_high_floor = _floor_profile(
+                    self._baseline_rms, self._baseline_high
+                )
+                self._baseline_rms = []
+                self._baseline_high = []
         self._trailing_rms.append(rms)
         self._trailing_high.append(high)
         if self._seen_blocks % self._evaluation_blocks == 0:
             self._evaluate()
 
     def _evaluate(self):
-        if (
-            self._baseline_floor is None
-            or len(self._trailing_rms) < self._trailing_rms.maxlen
-        ):
+        if len(self._trailing_rms) < self._trailing_rms.maxlen:
             return
         floor, high_floor = _floor_profile(self._trailing_rms, self._trailing_high)
         del floor  # reported by describe(); the decision is spectral
-        drifted = (
-            _dbfs(high_floor) >= MIN_AUDIBLE_HIGH_DBFS
-            and _dbfs(high_floor) - _dbfs(self._baseline_high_floor)
-            >= HIGH_BAND_RISE_DB
-        )
+        high_db = _dbfs(high_floor)
+        # Loud enough to be hiss on any station, whatever the take began as.
+        drifted = high_db >= RUNAWAY_HIGH_DBFS
+        if not drifted and self._baseline_high_floor is not None:
+            drifted = (
+                high_db >= MIN_AUDIBLE_HIGH_DBFS
+                and high_db - _dbfs(self._baseline_high_floor) >= HIGH_BAND_RISE_DB
+            )
         self._drift_votes.append(drifted)
 
     @property
@@ -191,10 +234,27 @@ class TakeFloorMonitor:
             return False
         return sum(votes) >= SUSTAIN_FRACTION * votes.maxlen
 
+    @property
+    def suspicious(self) -> bool:
+        """Whether the trailing floor is currently voting for drift.
+
+        Weaker than ``drifted``: the rise has not yet been sustained. Used at
+        moments that are already a musical boundary - a station change - where
+        carrying a state that has begun to hiss into the next station costs
+        nothing to avoid.
+        """
+        votes = self._drift_votes
+        return bool(votes) and votes[-1]
+
     def describe(self) -> str:
-        if self._baseline_floor is None or not self._trailing_rms:
+        if not self._trailing_rms:
             return "warming"
         floor, high_floor = _floor_profile(self._trailing_rms, self._trailing_high)
+        if self._baseline_floor is None:
+            return (
+                f"floor {_dbfs(floor):.1f} dBFS, high band {_dbfs(high_floor):.1f} dBFS "
+                "(no baseline yet)"
+            )
         return (
             f"floor {_dbfs(floor):.1f} dBFS, high band {_dbfs(high_floor):.1f} dBFS "
             f"(baseline {_dbfs(self._baseline_floor):.1f} / "

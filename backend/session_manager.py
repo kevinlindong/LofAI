@@ -675,20 +675,28 @@ class SessionManager:
                     if TAKE_GUARD:
                         monitor = session.floor_monitor
                         monitor.observe(pcm)
+                        reason = None
                         if monitor.drifted:
                             # The take has audibly grown a hiss bed out of its
-                            # own feedback. Splice onto a fresh recurrent state
-                            # under the same conditioning: one extra chunk of
-                            # render cost, no transport or session change.
+                            # own feedback.
+                            reason = f"take drifted ({monitor.describe()})"
+                        elif session.consume_refresh_request():
+                            # A station change landed while the floor had begun
+                            # to rise; the boundary is already audible, so a
+                            # fresh state costs nothing extra here.
+                            reason = "station changed while the floor was rising"
+                        if reason is not None:
+                            # Splice onto a fresh recurrent state under the same
+                            # conditioning: one extra chunk of render cost, no
+                            # transport or session change.
                             refreshed_seed = session.next_refresh_seed()
                             fresh_pcm, fresh_state = self.engine.generate(
                                 None, plan, seed=refreshed_seed
                             )
                             log.info(
-                                "session %s take drifted (%s); crossfading onto "
-                                "a fresh state",
+                                "session %s %s; crossfading onto a fresh state",
                                 session.id[:8],
-                                monitor.describe(),
+                                reason,
                             )
                             pcm = crossfade_pcm(pcm, fresh_pcm)
                             next_state = fresh_state
