@@ -329,6 +329,30 @@ await test("hello and live updates use the minimal listener protocol", async () 
   await stream.destroy()
 })
 
+await test("custom recipes send their prompt and dials without frontend metadata", async () => {
+  const runtime = loadStream(() => Promise.resolve())
+  const stream = new runtime.MrtStream(() => {})
+  const starting = stream.start(CONTROLS)
+  const socket = runtime.sockets[0]
+  socket.readyState = runtime.WebSocket.OPEN
+  socket.onopen()
+  await starting
+
+  stream.setControls({
+    ...CONTROLS, station: "custom", drums: false,
+    customPrompt: "ambient lo-fi, sleepy, felt piano, reverb", adherence: 0.8, variation: 0.3,
+    recipe: { instruments: ["piano"], vibe: "ambient", mood: "sleepy", effects: ["reverb"] },
+  })
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)), {
+    type: "controls", station: "custom", drums: false,
+    customPrompt: "ambient lo-fi, sleepy, felt piano, reverb", adherence: 0.8, variation: 0.3,
+  })
+
+  stream.setControls({ ...CONTROLS, station: "sunlit-groove" })
+  assert.equal(JSON.parse(socket.sent.at(-1)).customPrompt, "")
+  await stream.destroy()
+})
+
 await test("a new take drops old PCM until its fresh-session acknowledgement", async () => {
   const runtime = loadStream(() => Promise.resolve())
   const states = []

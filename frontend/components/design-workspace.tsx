@@ -6,21 +6,14 @@ import { AsciiAmbience } from "@/components/ascii-ambience"
 import { DotGlyph } from "@/components/dot-glyph"
 import { DotSlider } from "@/components/dot-slider"
 import { DotVisualizer } from "@/components/dot-visualizer"
-import { STATION_PRESETS } from "@/components/music-controls"
+import { SoundEditor } from "@/components/sound-editor"
 import { Pet } from "@/components/pet"
 import { PomodoroTimer } from "@/components/pomodoro-timer"
 import { TodoList } from "@/components/todo-list"
 import { useRadio } from "@/components/radio-provider"
 import { applyDesignAppearance, DESIGNS, DESIGN_TONES, type NewDesign, type DesignTone } from "@/lib/designs"
-import type { ListenerControls } from "@/lib/mrt-stream"
-
-// The alternate designs present only the named stations. A listener can pick
-// the custom prompt on the original interface and then open a design via an
-// in-app link, so resolve to the first named station rather than crashing on
-// a station id ("custom") these tiled designs do not list.
-function namedStation(stationId: string) {
-  return STATION_PRESETS.find((entry) => entry.id === stationId) ?? STATION_PRESETS[0]
-}
+import { MAX_CUSTOM_PROMPT_CHARS } from "@/lib/mrt-stream"
+import { CUSTOM_STATION, describeSound, STATION_PRESETS, type RadioControls } from "@/lib/sound-recipe"
 
 interface Preferences {
   tone: DesignTone
@@ -30,7 +23,7 @@ interface Preferences {
 
 interface SavedMix {
   name: string
-  controls: ListenerControls
+  controls: RadioControls
   volume: number
 }
 
@@ -87,21 +80,24 @@ function VariationButton() {
 }
 
 function StationList({ layout = "list" }: { layout?: "list" | "tiles" | "keys" }) {
-  const { controls, setControls, isLive } = useRadio()
+  const { controls, selectStation, isLive } = useRadio()
   return (
-    <div className={`station-selector stations-${layout}`} role="group" aria-label="Choose your station">
-      {STATION_PRESETS.map((station, index) => {
-        const selected = controls.station === station.id
-        return (
-          <button key={station.id} type="button" className={`station-option ${selected ? "is-selected" : ""}`} aria-pressed={selected} onClick={() => setControls({ ...controls, station: station.id })}>
-            <span className="station-index">0{index + 1}</span>
-            {layout === "list" && <StationArt station={station.id} small />}
-            <span className="station-copy"><strong>{station.label}</strong><span>{STATION_MOODS[index]}</span></span>
-            <span className={`station-indicator ${selected && isLive ? "is-live" : ""}`} aria-hidden="true"><i /><i /><i /></span>
-          </button>
-        )
-      })}
-    </div>
+    <>
+      <div className={`station-selector stations-${layout}`} role="group" aria-label="Choose your station">
+        {STATION_PRESETS.map((station, index) => {
+          const selected = controls.station === station.id
+          return (
+            <button key={station.id} type="button" className={`station-option ${selected ? "is-selected" : ""}`} aria-pressed={selected} onClick={() => selectStation(station.id)}>
+              <span className="station-index">0{index + 1}</span>
+              {layout === "list" && <StationArt station={station.id} small />}
+              <span className="station-copy"><strong>{station.label}</strong><span>{STATION_MOODS[index]}</span></span>
+              <span className={`station-indicator ${selected && isLive ? "is-live" : ""}`} aria-hidden="true"><i /><i /><i /></span>
+            </button>
+          )
+        })}
+      </div>
+      <SoundEditor showPresets={false} />
+    </>
   )
 }
 
@@ -121,11 +117,11 @@ function Mixer() {
 }
 
 function ScenePresets() {
-  const { controls, setControls, setVolume } = useRadio()
+  const { controls, selectStation, setVolume } = useRadio()
   return (
     <div className="scene-presets" role="group" aria-label="Listening presets">
       {PRESETS.map((preset, index) => (
-        <button key={preset.name} type="button" title={preset.description} aria-pressed={controls.station === preset.station && controls.drums === preset.drums} onClick={() => { setControls({ ...controls, station: preset.station, drums: preset.drums, customPrompt: "" }); setVolume(preset.volume) }}>
+        <button key={preset.name} type="button" title={preset.description} aria-pressed={controls.station === preset.station && controls.drums === preset.drums} onClick={() => { selectStation(preset.station, { drums: preset.drums }); setVolume(preset.volume) }}>
           <span className="preset-mark" aria-hidden="true">{["◒", "≈", "✳"][index]}</span>{preset.name}
         </button>
       ))}
@@ -193,7 +189,7 @@ function DesignHeader({ design, openSettings, openWorkspace }: { design: NewDesi
 
 function Sunday({ preferences }: { preferences: Preferences }) {
   const { controls } = useRadio()
-  const station = namedStation(controls.station)
+  const station = describeSound(controls)
   return (
     <>
       <div className="sunday-heading">
@@ -223,7 +219,7 @@ function Sunday({ preferences }: { preferences: Preferences }) {
 
 function Form({ preferences }: { preferences: Preferences }) {
   const { controls } = useRadio()
-  const station = namedStation(controls.station)
+  const station = describeSound(controls)
   return (
     <div className="form-shell">
       <aside className="form-sidebar">
@@ -252,18 +248,18 @@ function Form({ preferences }: { preferences: Preferences }) {
 
 function Signal({ preferences }: { preferences: Preferences }) {
   const { controls, isLive } = useRadio()
-  const stationIndex = Math.max(0, STATION_PRESETS.findIndex((entry) => entry.id === controls.station))
-  const station = STATION_PRESETS[stationIndex]
+  const stationIndex = STATION_PRESETS.findIndex((entry) => entry.id === controls.station)
+  const station = describeSound(controls)
   return (
     <>
       <div className="signal-heading"><p className="design-eyebrow">A modern ritual. An analog state of mind.</p><h1>Good sound.<br /><span>No end in sight.</span></h1><span className="signal-seal">HIGH<br />FIDELITY<span>∞</span></span></div>
       <section className="receiver" id="radio" aria-label="Radio receiver">
         <div className="receiver-top"><span className="receiver-logo">lofAI <span>STEREO RECEIVER</span></span><span>MODEL 004 / CONTINUOUS PLAY</span><span className={`receiver-lamp ${isLive ? "is-live" : ""}`}>{isLive ? "ON AIR" : "STANDBY"}</span></div>
-        <div className="tuner" aria-hidden="true"><div className="tuner-labels"><span>01 — DUSTY</span><span>02 — RAINY</span><span>03 — JAZZ</span><span>04 — SUNLIT</span></div><div className="tuner-scale"><span style={{ "--tuner-position": `${12.5 + stationIndex * 25}%` } as CSSProperties} /></div><span className="tuner-band">PERSONAL FREQUENCY / FM ∞</span></div>
+        <div className="tuner" aria-hidden="true"><div className="tuner-labels"><span>01 — DUSTY</span><span>02 — RAINY</span><span>03 — JAZZ</span><span>04 — SUNLIT</span></div><div className="tuner-scale"><span hidden={stationIndex < 0} style={{ "--tuner-position": `${12.5 + stationIndex * 25}%` } as CSSProperties} /></div><span className="tuner-band">PERSONAL FREQUENCY / FM ∞</span></div>
         <div className="receiver-body">
           <div className="receiver-disc"><span className="receiver-disc-label">LIQUID FREQUENCY DISPLAY</span><RecordPlayer /><span className="receiver-disc-bottom">GENERATIVE STEREO SOUND</span></div>
           <div className="receiver-controls">
-            <div className="signal-display"><span className="display-label">CHANNEL 0{stationIndex + 1} <span>STEREO · ∞</span></span><h2>{station.label}</h2><p>{station.description}</p><Status /></div>
+            <div className="signal-display"><span className="display-label">{stationIndex < 0 ? "CUSTOM MIX" : `CHANNEL 0${stationIndex + 1}`} <span>STEREO · ∞</span></span><h2>{station.label}</h2><p>{station.description}</p><Status /></div>
             <div className="hardware-label"><span>STATION MEMORY</span><span>PUSH TO TUNE ↓</span></div>
             <StationList layout="keys" />
             <Mixer />
@@ -281,7 +277,7 @@ function Signal({ preferences }: { preferences: Preferences }) {
 function Customization({ design, preferences, updatePreferences, dialogRef }: {
   design: NewDesign; preferences: Preferences; updatePreferences: (next: Partial<Preferences>) => void; dialogRef: React.RefObject<HTMLDialogElement>
 }) {
-  const { controls, setControls, volume, setVolume } = useRadio()
+  const { controls, restoreMix, volume, setVolume } = useRadio()
   const [mixName, setMixName] = useState("")
   const [mixes, setMixes] = useState<SavedMix[]>([])
   const [notice, setNotice] = useState("")
@@ -289,7 +285,12 @@ function Customization({ design, preferences, updatePreferences, dialogRef }: {
   useEffect(() => {
     try {
       const saved: unknown = JSON.parse(localStorage.getItem("lofai.saved-mixes") || "[]")
-      if (Array.isArray(saved)) setMixes(saved.filter((mix): mix is SavedMix => typeof mix?.name === "string" && STATION_PRESETS.some((s) => s.id === mix.controls?.station) && typeof mix.controls?.drums === "boolean" && Number.isFinite(mix.volume) && mix.volume >= 0 && mix.volume <= 100).slice(0, 6))
+      if (Array.isArray(saved)) setMixes(saved.filter((mix): mix is SavedMix =>
+        typeof mix?.name === "string" && typeof mix.controls?.drums === "boolean" &&
+        (STATION_PRESETS.some((s) => s.id === mix.controls?.station) ||
+          (mix.controls?.station === CUSTOM_STATION && typeof mix.controls.customPrompt === "string" && mix.controls.customPrompt.length <= MAX_CUSTOM_PROMPT_CHARS)) &&
+        Number.isFinite(mix.volume) && mix.volume >= 0 && mix.volume <= 100,
+      ).slice(0, 6))
     } catch { /* Saved mixes are optional; controls remain usable. */ }
   }, [])
 
@@ -301,7 +302,7 @@ function Customization({ design, preferences, updatePreferences, dialogRef }: {
 
   const saveMix = (event: FormEvent) => {
     event.preventDefault()
-    const name = mixName.trim() || STATION_PRESETS.find((station) => station.id === controls.station)!.label
+    const name = mixName.trim() || describeSound(controls).label
     if (mixes.length >= 6) { setNotice("Your six mix slots are full. Remove one to save another."); return }
     storeMixes([...mixes, { name, controls: { ...controls }, volume }], `“${name}” saved.`)
     setMixName("")
@@ -314,7 +315,7 @@ function Customization({ design, preferences, updatePreferences, dialogRef }: {
         <p className="dialog-intro">A few small changes. A space that feels like you.</p>
         <fieldset><legend>01 / Color story</legend><div className="tone-options">{DESIGN_TONES[design.slug].map((tone) => <button key={tone.id} type="button" aria-pressed={preferences.tone === tone.id} onClick={() => updatePreferences({ tone: tone.id })}><span style={{ backgroundColor: tone.color }}>{preferences.tone === tone.id && <DotGlyph name="check" dot={2} color="#fff" />}</span>{tone.name}</button>)}</div></fieldset>
         <fieldset><legend>02 / Set the mood</legend><ScenePresets /><p className="settings-helper">Instantly sets the station, drums, and volume.</p></fieldset>
-        <fieldset><legend>03 / Keep a favorite</legend><form className="save-mix-form" onSubmit={saveMix}><input aria-label="Mix name" placeholder="Give this mix a name" value={mixName} onChange={(event) => setMixName(event.target.value)} maxLength={36} /><button type="submit">Save mix <span>+</span></button></form><p className="settings-helper">Saves your current station, drum setting, and volume.</p><div className="saved-mixes">{mixes.map((mix, index) => <div key={`${index}-${mix.name}`}><button type="button" onClick={() => { setControls({ ...mix.controls }); setVolume(mix.volume); setNotice(`“${mix.name}” loaded.`) }}><DotGlyph name="music" dot={1} /><span>{mix.name}</span><span>↗</span></button><button type="button" aria-label={`Remove saved mix ${mix.name}`} onClick={() => storeMixes(mixes.filter((_, i) => i !== index), `“${mix.name}” removed.`)}><DotGlyph name="cross" dot={1} /></button></div>)}</div><p className="settings-notice" role="status">{notice}</p></fieldset>
+        <fieldset><legend>03 / Keep a favorite</legend><form className="save-mix-form" onSubmit={saveMix}><input aria-label="Mix name" placeholder="Give this mix a name" value={mixName} onChange={(event) => setMixName(event.target.value)} maxLength={36} /><button type="submit">Save mix <span>+</span></button></form><p className="settings-helper">Saves your applied sound, instruments, mood, effects, dials, drums, and volume.</p><div className="saved-mixes">{mixes.map((mix, index) => <div key={`${index}-${mix.name}`}><button type="button" onClick={() => { restoreMix(mix.controls); setVolume(mix.volume); setNotice(`“${mix.name}” loaded.`) }}><DotGlyph name="music" dot={1} /><span>{mix.name}</span><span>↗</span></button><button type="button" aria-label={`Remove saved mix ${mix.name}`} onClick={() => storeMixes(mixes.filter((_, i) => i !== index), `“${mix.name}” removed.`)}><DotGlyph name="cross" dot={1} /></button></div>)}</div><p className="settings-notice" role="status">{notice}</p></fieldset>
         <fieldset><legend>04 / Your workspace</legend>{([ ["tasks", "Task list", "A place for what’s on your mind."], ["companion", "A little company", "Keep your dot-matrix cat close."] ] as const).map(([key, label, description]) => <label className="preference-toggle" key={key}><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={preferences[key]} onChange={(event) => updatePreferences({ [key]: event.target.checked })} /></label>)}</fieldset>
         <fieldset><legend>05 / Wind down</legend><SleepTimer expanded /><p className="settings-helper">Music pauses when the time is up.</p></fieldset>
         <div className="keyboard-hints"><span><kbd>space</kbd> play / pause</span><span><kbd>M</kbd> mute</span><span><kbd>N</kbd> new take</span></div>

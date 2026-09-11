@@ -1020,71 +1020,6 @@
     box-shadow: var(--shadow-soft);
   }
 
-  .control-select {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid var(--line-color);
-    border-radius: 0.6rem;
-    background: transparent;
-    color: var(--text);
-    font-size: 0.875rem;
-  }
-
-  .control-dials {
-    display: grid;
-    gap: clamp(0.6rem, 1.2vw, 0.9rem);
-  }
-
-  .control-prompt {
-    margin-top: 0.65rem;
-    display: grid;
-    gap: 0.5rem;
-  }
-
-  .control-prompt-input {
-    width: 100%;
-    padding: 0.55rem 0.75rem;
-    border: 1px solid var(--line-color);
-    border-radius: 0.6rem;
-    background: color-mix(in srgb, var(--surface-strong) 60%, transparent);
-    color: var(--text);
-    font-size: 0.85rem;
-  }
-
-  .control-prompt-input::placeholder {
-    color: var(--text-faint);
-  }
-
-  .control-prompt-input:focus-visible {
-    outline: none;
-    border-color: color-mix(in srgb, var(--accent) 60%, var(--line-color));
-    box-shadow: 0 0 0 0.18rem color-mix(in srgb, var(--accent) 18%, transparent);
-  }
-
-  .control-prompt-suggestions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.35rem;
-  }
-
-  .prompt-chip {
-    padding: 0.28rem 0.6rem;
-    border: 1px solid var(--line-color);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--text-dim);
-    font-size: 0.68rem;
-    line-height: 1.2;
-    cursor: pointer;
-    transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
-  }
-
-  .prompt-chip:hover {
-    color: var(--text);
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--line-color));
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-
   .flow-range-shell {
     position: relative;
     display: flex;
@@ -1327,20 +1262,6 @@
 
   .tasks-card {
     grid-row: span 2;
-  }
-}
-
-@media (min-width: 1120px) {
-  .control-bank {
-    width: 100%;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    column-gap: 1.5rem;
-    row-gap: 1.15rem;
-  }
-
-  .control-station,
-  .control-arrangement {
-    grid-column: 1 / -1;
   }
 }
 

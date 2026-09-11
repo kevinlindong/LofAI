@@ -2,7 +2,8 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import type { PetEvent, PetSignal } from "@/components/pet"
-import { DEFAULT_LISTENER_CONTROLS, MrtStream, type ListenerControls, type StreamState } from "@/lib/mrt-stream"
+import { DEFAULT_LISTENER_CONTROLS, MrtStream, type StreamState } from "@/lib/mrt-stream"
+import { CUSTOM_STATION, soundDraftFor, STATION_PRESETS, type RadioControls, type SoundDraft } from "@/lib/sound-recipe"
 
 const IDLE_STATE: StreamState = {
   status: "idle", queuePosition: 0, listeners: 0, capacity: 0,
@@ -24,7 +25,8 @@ function statusLabel(state: StreamState, wantsAudio: boolean): string {
 }
 
 function useRadioState() {
-  const [controls, setControls] = useState<ListenerControls>({ ...DEFAULT_LISTENER_CONTROLS })
+  const [controls, setControls] = useState<RadioControls>({ ...DEFAULT_LISTENER_CONTROLS })
+  const [soundDraft, setSoundDraft] = useState<SoundDraft>(() => soundDraftFor(DEFAULT_LISTENER_CONTROLS))
   const [volume, setVolume] = useState(100)
   const [wantsAudio, setWantsAudio] = useState(false)
   const [streamState, setStreamState] = useState<StreamState>(IDLE_STATE)
@@ -34,6 +36,22 @@ function useRadioState() {
   const [sleepRemaining, setSleepRemaining] = useState(0)
   const streamRef = useRef<MrtStream | null>(null)
   const previousVolume = useRef(100)
+
+  const selectStation = (station: string, overrides: Partial<RadioControls> = {}) => {
+    const preset = STATION_PRESETS.find((entry) => entry.id === station)
+    if (!preset) return
+    setControls({ ...controls, ...overrides, station, customPrompt: "", recipe: undefined })
+    setSoundDraft((draft) => ({ ...draft, mode: "builder", recipe: preset.recipe }))
+  }
+
+  const restoreMix = (saved: RadioControls) => {
+    const next = { ...DEFAULT_LISTENER_CONTROLS, ...saved }
+    const draft = soundDraftFor(next)
+    // Older saved mixes have no recipe or granular dials.
+    next.recipe = next.station === CUSTOM_STATION && draft.mode === "builder" ? draft.recipe : undefined
+    setControls(next)
+    setSoundDraft(draft)
+  }
 
   useEffect(() => {
     const stream = new MrtStream(setStreamState)
@@ -92,7 +110,7 @@ function useRadioState() {
     const handleKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement
       if (event.repeat || event.metaKey || event.ctrlKey || event.altKey ||
-        target.closest("input, textarea, select, button, a, [contenteditable], dialog")) return
+        target.closest("input, textarea, select, button, a, summary, [contenteditable], dialog")) return
       if (event.code === "Space") { event.preventDefault(); void togglePlayback() }
       if (event.key.toLowerCase() === "m") toggleMute()
       if (event.key.toLowerCase() === "n" && wantsAudio && !streamState.variationPending) requestVariation()
@@ -103,7 +121,8 @@ function useRadioState() {
 
   const label = useMemo(() => statusLabel(streamState, wantsAudio), [streamState, wantsAudio])
   return {
-    controls, setControls, volume, setVolume, wantsAudio, streamState,
+    controls, setControls, soundDraft, setSoundDraft, selectStation, restoreMix,
+    volume, setVolume, wantsAudio, streamState,
     isLive: streamState.status === "live", petSignal, focusMode, setFocusMode,
     togglePlayback, requestVariation, getLevel, getSpectrum, handlePetEvent,
     toggleMute, label, sleepEndsAt, sleepRemaining, setSleepTimer,
